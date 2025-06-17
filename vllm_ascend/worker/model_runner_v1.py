@@ -98,7 +98,6 @@ import vllm.envs as envs_vllm
 
 import vllm_ascend.envs as envs_ascend
 
-
 @dataclass
 class GraphCaptureContext:
     stream: torch.npu.Stream
@@ -1396,10 +1395,14 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             if self.dynamic_eplb:
                 self.eplb_updator.take_update_info_from_eplb_process()
 
-        with ProfileExecuteDuration().capture_async("post process"):
-            logits = self.model.compute_logits(hidden_states[sample_indices],
-                                               None)
-
+        with ProfileExecuteDuration().capture_async("post process"): 
+            if self.torchair_graph_enabled and attn_metadata.prefill is None:
+                logits = self.model.compute_logits(hidden_states, None)
+                logits = logits[sample_indices]
+            else:
+                logits = self.model.compute_logits(hidden_states[sample_indices], None)
+            if self.use_eagle:
+                attn_metadata = self.get_eagle_atten_dict(scheduler_output)
             # Apply structured output bitmasks if present
             if scheduler_output.grammar_bitmask is not None:
                 logits = self.apply_grammar_bitmask(scheduler_output, logits)
@@ -1779,6 +1782,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                         inputs_embeds=None,
                         **model_kwargs,
                     )
+                    self.model.compute_logits(hidden_states, None)
                 else:
                     if envs_ascend.VLLM_ASCEND_ENABLE_DBO:
                         model_kwargs["graph_enable"] = False  # type: ignore
@@ -1848,7 +1852,6 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             logits = self.model.compute_logits(hidden_states, None)
         else:
             logits = None
-
         NPUPlatform.synchronize()
         del hidden_states, logits
         self.encoder_cache.clear()
