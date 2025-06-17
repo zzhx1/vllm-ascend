@@ -40,11 +40,13 @@ The details of each config option are as follows:
 | Name | Type | Default | Description |
 | ---- | ---- | ------- | ----------- |
 | `enabled` | bool | `False` | Whether to enable torchair graph mode |
+| `enable_multistream_mla`| bool | `False` | Whether to put vector ops of MLA to another stream |
+| `enable_multistream_moe`| bool | `False` | Whether to enable multistream shared expert |
 | `enable_view_optimize` | bool | `True` | Whether to enable torchair view optimization |
 | `use_cached_graph` | bool | `False` | Whether to use cached graph |
 | `graph_batch_sizes` | list[int] | `[]` | The batch size for torchair graph cache |
 | `graph_batch_sizes_init` | bool | `False` | Init graph batch size dynamically if `graph_batch_sizes` is empty |
-| `enable_multistream_shared_expert`| bool | `False` | Whether to enable multistream shared expert |
+| `enable_kv_nz`| bool | `False` | Whether to enable kvcache NZ layout |
 
 **ascend_scheduler_config**
 
@@ -52,7 +54,7 @@ The details of each config option are as follows:
 | ---- | ---- | ------- | ----------- |
 | `enabled` | bool | `False` | Whether to enable ascend scheduler for V1 engine|
 
-ascend_scheduler_config also support the options from [vllm scheduler config](https://docs.vllm.ai/en/stable/api/vllm/config.html#vllm.config.SchedulerConfig). For example, you  can add `chunked_prefill_enabled: true` to ascend_scheduler_config as well.
+ascend_scheduler_config also support the options from [vllm scheduler config](https://docs.vllm.ai/en/stable/api/vllm/config.html#vllm.config.SchedulerConfig). For example, you can add `enable_chunked_prefill: True` to ascend_scheduler_config as well.
 
 ### Example
 
@@ -61,17 +63,18 @@ A full example of additional configuration is as follows:
 ```
 {
     "torchair_graph_config": {
-        "enabled": true,
-        "use_cached_graph": true,
+        "enabled": True,
+        "use_cached_graph": True,
         "graph_batch_sizes": [1, 2, 4, 8],
-        "graph_batch_sizes_init": false,
-        "enable_multistream_shared_expert": false
+        "graph_batch_sizes_init": False,
+        "enable_multistream_moe": False,
+        "enable_kv_nz": False
     },
     "ascend_scheduler_config": {
-        "enabled": true,
-        "chunked_prefill_enabled": true,
+        "enabled": True,
+        "enable_chunked_prefill": True,
     },
     "expert_tensor_parallel_size": 1,
-    "refresh": false,
+    "refresh": False,
 }
 ```
