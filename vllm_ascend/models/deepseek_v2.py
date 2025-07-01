@@ -72,6 +72,7 @@ from vllm_ascend.ops.fused_moe import AscendFusedMoE
 from vllm_ascend.quantization.quant_config import AscendLinearMethod
 from vllm_ascend.quantization.w8a8_dynamic import AscendW8A8DynamicLinearMethod
 from vllm_ascend.utils import dispose_tensor, npu_prefetch
+from vllm_ascend.ops.linear import Oproj_RowParallelLinear
 
 
 class RowParallelScatterLinear(RowParallelLinear):
@@ -417,7 +418,6 @@ class CustomDeepseekV2MLAAttention(DeepseekV2MLAAttention):
         self.scaling = self.qk_head_dim**-0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
-
         if self.q_lora_rank is not None:
             self.q_a_proj = ReplicatedLinear(self.hidden_size,
                                              self.q_lora_rank,
@@ -460,7 +460,7 @@ class CustomDeepseekV2MLAAttention(DeepseekV2MLAAttention):
 
         if not self.enable_prefill_optimizations or int(
                 prefix.split(".")[-2]) < 3:
-            self.o_proj = RowParallelLinear(self.num_heads * self.v_head_dim,
+            self.o_proj = Oproj_RowParallelLinear(self.num_heads * self.v_head_dim,
                                             self.hidden_size,
                                             bias=False,
                                             quant_config=quant_config,
