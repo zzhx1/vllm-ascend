@@ -110,7 +110,8 @@ class AscendQwen3MoeSparseMoeBlock(nn.Module):
     def forward(
             self,
             hidden_states: torch.Tensor,
-            attn_metadata: Optional[AttentionMetadata] = None) -> torch.Tensor:
+            attn_metadata: Optional[AttentionMetadata] = None,
+            _metadata_for_padding: Optional[MetadataForPadding] = None) -> torch.Tensor:
         if attn_metadata is None:
             attn_metadata = get_forward_context().attn_metadata
         # when profile runs, force experts to load balanced tokens
@@ -133,6 +134,7 @@ class AscendQwen3MoeSparseMoeBlock(nn.Module):
             top_k=self.top_k,
             enable_force_load_balance=enable_force_load_balance,
             shared_experts=None,
+            _metadata_for_padding=_metadata_for_padding
         )
 
         return hidden_states
@@ -366,7 +368,7 @@ class AscendQwen3MoeDecoderLayer(nn.Module):
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual)
 
-        hidden_states = self.mlp(hidden_states, kv_cache, attn_metadata,
+        hidden_states = self.mlp(hidden_states, attn_metadata,
                                  _metadata_for_padding=_metadata_for_padding)
 
         return hidden_states, residual
