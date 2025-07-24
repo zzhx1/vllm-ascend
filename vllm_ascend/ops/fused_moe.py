@@ -48,7 +48,7 @@ from vllm_ascend.ops.moe_dispatcher.token_dispatcher import (
     MoEAlltoAllSeqOverLapDispatcher, MoEDispatcherConfig)
 from vllm_ascend.utils import (AscendSocVersion, dispose_tensor,
                                get_ascend_soc_version, npu_stream_switch,
-                               npu_wait_tensor)
+                               npu_wait_tensor, super_kernel)
 
 VLLM_ASCEND_MOE_ALL2ALL_BUFFER: bool = envs_ascend.VLLM_ASCEND_MOE_ALL2ALL_BUFFER
 
@@ -1148,6 +1148,7 @@ class AscendFusedMoE(FusedMoE):
 
         AscendFusedMoE.moe_counter += 1
         self.moe_instance_id = AscendFusedMoE.moe_counter
+        self.prefix = prefix
 
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
@@ -1210,6 +1211,9 @@ class AscendFusedMoE(FusedMoE):
         self.enable_multistream_moe = (
             ascend_config.torchair_graph_config.enable_multistream_moe
             and self.torchair_graph_enabled)
+        self.enable_super_kernel = (
+            ascend_config.torchair_graph_config.enable_super_kernel
+            and self.enable_multistream_moe)
 
         if self.scoring_func != "softmax" and not self.use_grouped_topk:
             raise ValueError("Only softmax scoring function is supported for "
@@ -1304,15 +1308,22 @@ class AscendFusedMoE(FusedMoE):
         from vllm_ascend.quantization.w8a8_dynamic import \
             AscendW8A8DynamicFusedMoEMethod
 
+        running_in_super_kernel = self.enable_super_kernel and fused_moe_state == FusedMoEState.MC2
         if self.enable_multistream_moe:
             assert gate is not None
-            router_logits, _ = gate(hidden_states)
-            if (isinstance(self.quant_method.quant_method,
-                           AscendW8A8DynamicFusedMoEMethod)
-                    and fused_moe_state == FusedMoEState.MC2):
-                with npu_stream_switch("moe_secondary", 0):
-                    quantized_x_for_share, dynamic_scale_for_share = (
-                        torch_npu.npu_dynamic_quant(hidden_states))
+            with super_kernel(self.prefix,
+                              "stream-fusion=1",
+                              enabled=running_in_super_kernel):
+                if self.enable_super_kernel:
+                    router_logits, _ = gate(hidden_states.float())
+                else:
+                    router_logits, _ = gate(hidden_states)
+                if (isinstance(self.quant_method.quant_method,
+                               AscendW8A8DynamicFusedMoEMethod)
+                        and fused_moe_state == FusedMoEState.MC2):
+                    with npu_stream_switch("moe_secondary", 0):
+                        quantized_x_for_share, dynamic_scale_for_share = (
+                            torch_npu.npu_dynamic_quant(hidden_states))
 
         if shared_experts:
             if not self.enable_multistream_moe or fused_moe_state != FusedMoEState.MC2:
@@ -1389,6 +1400,8 @@ class AscendFusedMoE(FusedMoE):
             dynamic_scale_for_share=dynamic_scale_for_share,
             mc2_mask=mc2_mask,
             token_dispatcher=self.token_dispatcher,
+            prefix=self.prefix,
+            running_in_super_kernel=running_in_super_kernel,
         )
 
         if isinstance(e_hidden_states, tuple):
