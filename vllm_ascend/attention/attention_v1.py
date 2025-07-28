@@ -212,8 +212,6 @@ class AscendAttentionMetadataBuilder:
         # TODO: Refactor these two param to common metadata in runners,
         # preparing for the hybrid KV groups feature
         query_lens = common_attn_metadata.query_lens or self.runner.query_lens
-        # Since FIA for GQA is not active now, we temporarily silence it
-        seq_lens_list = common_attn_metadata.seq_lens_list
 
         slot_mapping = self.runner.slot_mapping[:num_actual_tokens]
         attn_mask = self.runner.attn_mask

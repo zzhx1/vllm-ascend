@@ -37,15 +37,13 @@ from vllm.model_executor.layers.linear import (QKVParallelLinear,
                                                RowParallelLinear)
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
-from vllm.model_executor.layers.rotary_embedding import (RotaryEmbedding,
-                                                         get_rope)
+from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead, VocabParallelEmbedding)
 from vllm.model_executor.models.interfaces import SupportsPP
 from vllm.model_executor.models.qwen3_moe import \
     Qwen3MoeSparseMoeBlock  # noqa: F401
 from vllm.model_executor.models.qwen3_moe import (Qwen3MoeAttention,
-                                                  Qwen3MoeDecoderLayer,
                                                   Qwen3MoeForCausalLM,
                                                   Qwen3MoeMLP, Qwen3MoeModel)
 from vllm.model_executor.models.utils import (
@@ -55,7 +53,7 @@ from vllm.sequence import IntermediateTensors
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
-from vllm_ascend.ops.fused_moe import AscendFusedMoE, AscendSparseMoeBlock
+from vllm_ascend.ops.fused_moe import AscendFusedMoE
 from vllm_ascend.ops.sequence_parallel import (MetadataForPadding,
                                                init_metadata_for_sp)
 
