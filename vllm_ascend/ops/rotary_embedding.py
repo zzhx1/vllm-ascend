@@ -272,7 +272,7 @@ def qwen_rope_init_func(
 
     cache = self._compute_cos_sin_cache()
     cache = cache.to(dtype)
-    self.cos_sin_cache: torch.Tensor
+    self.cos_sin_cache: torch.Tensor  # type: ignore[misc]
     self.register_buffer("cos_sin_cache", cache, persistent=False)
     if get_ascend_config().torchair_graph_config.enabled:
         __set_cos_sin_cache(self,
@@ -292,7 +292,7 @@ def rope_forward(
 ):
     if not get_ascend_config().torchair_graph_config.enabled or is_prefill:
         return rope_forward_oot(self, positions_ids, query, key, offsets,
-                                max_seq_len)
+                                max_seq_len)  # type: ignore
 
     if max_seq_len is not None and torch.gt(max_seq_len,
                                             self.max_position_embeddings):
