@@ -39,6 +39,8 @@ def rope_forward_oot(
         query: torch.Tensor,
         key: torch.Tensor,
         offsets: Optional[torch.Tensor] = None,
+        cos: torch.Tensor = None,
+        sin: torch.Tensor = None,
         is_neox_style_override: Optional[bool] = None,
         is_cos_sin_cached: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
     import torch_npu
@@ -283,16 +285,21 @@ def qwen_rope_init_func(
 
 def rope_forward(
     self,
-    positions_ids: torch.Tensor,
+    positions: torch.Tensor,
     query: torch.Tensor,
     key: torch.Tensor,
     offsets: Optional[torch.Tensor] = None,
+    cos: torch.Tensor = None,
+    sin: torch.Tensor = None,
+    is_neox_style_override: Optional[bool] = None,
+    is_cos_sin_cached: bool = False,
     max_seq_len: Optional[int] = None,
     is_prefill: Optional[bool] = True,
 ):
     if not get_ascend_config().torchair_graph_config.enabled or is_prefill:
-        return rope_forward_oot(self, positions_ids, query, key, offsets,
-                                max_seq_len)  # type: ignore
+        return rope_forward_oot(self, positions, query, key, offsets, cos, sin,
+                                is_neox_style_override,
+                                is_cos_sin_cached)  # type: ignore
 
     if max_seq_len is not None and torch.gt(max_seq_len,
                                             self.max_position_embeddings):
@@ -302,9 +309,9 @@ def rope_forward(
                             dtype=torch.float32)
 
     # b s n d/b n s d
-    if positions_ids is not None:
-        cos = self.embed(positions_ids, self.cos)
-        sin = self.embed(positions_ids, self.sin)
+    if positions is not None:
+        cos = self.embed(positions, self.cos)
+        sin = self.embed(positions, self.sin)
         self.cos_embed = cos
         self.sin_embed = sin
         # [128] -> [1,1,1,128]
