@@ -106,10 +106,11 @@ class AscendQwen3MoeSparseMoeBlock(nn.Module):
         self.params_dtype = torch.get_default_dtype()
 
     def forward(
-            self,
-            hidden_states: torch.Tensor,
-            attn_metadata: Optional[AttentionMetadata] = None,
-            _metadata_for_padding: Optional[MetadataForPadding] = None) -> torch.Tensor:
+        self,
+        hidden_states: torch.Tensor,
+        attn_metadata: Optional[AttentionMetadata] = None,
+        _metadata_for_padding: Optional[MetadataForPadding] = None
+    ) -> torch.Tensor:
         if attn_metadata is None:
             attn_metadata = get_forward_context().attn_metadata
         # when profile runs, force experts to load balanced tokens
@@ -132,8 +133,7 @@ class AscendQwen3MoeSparseMoeBlock(nn.Module):
             top_k=self.top_k,
             enable_force_load_balance=enable_force_load_balance,
             shared_experts=None,
-            _metadata_for_padding=_metadata_for_padding
-        )
+            _metadata_for_padding=_metadata_for_padding)
 
         return hidden_states
 
@@ -303,8 +303,8 @@ class AscendQwen3MoeDecoderLayer(nn.Module):
                 config.num_experts > 0 and
             (layer_idx + 1) % config.decoder_sparse_step == 0):
             self.mlp = AscendQwen3MoeSparseMoeBlock(config=config,
-                                            quant_config=quant_config,
-                                            prefix=f"{prefix}.mlp")
+                                                    quant_config=quant_config,
+                                                    prefix=f"{prefix}.mlp")
         else:
             self.mlp = Qwen3MoeMLP(hidden_size=config.hidden_size,
                                    intermediate_size=config.intermediate_size,
@@ -366,7 +366,8 @@ class AscendQwen3MoeDecoderLayer(nn.Module):
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual)
 
-        hidden_states = self.mlp(hidden_states, attn_metadata,
+        hidden_states = self.mlp(hidden_states,
+                                 attn_metadata,
                                  _metadata_for_padding=_metadata_for_padding)
 
         return hidden_states, residual
@@ -427,7 +428,9 @@ class AscendQwen3MoeModel(Qwen3MoeModel):
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
             hidden_states, residual = layer(
-                positions, hidden_states, residual,
+                positions,
+                hidden_states,
+                residual,
                 kv_caches[i -
                           self.start_layer] if kv_caches is not None else None,
                 attn_metadata,
