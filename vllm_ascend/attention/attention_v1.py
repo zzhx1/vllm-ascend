@@ -323,7 +323,7 @@ class AscendAttentionMetadataBuilder:
                 "Currently we only support building dummy metadata for DecodeOnly state"
             )
 
-        attn_metadata.attn_state = attn_state  # ttttodo 检查是否走这里 可用
+        attn_metadata.attn_state = attn_state
         return attn_metadata
 
 

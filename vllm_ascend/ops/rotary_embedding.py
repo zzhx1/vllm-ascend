@@ -308,14 +308,12 @@ def rope_forward(
                             device=query.device,
                             dtype=torch.float32)
 
-    # b s n d/b n s d
+    # bsnd/bnsd
     if positions is not None:
         cos = self.embed(positions, self.cos)
         sin = self.embed(positions, self.sin)
         self.cos_embed = cos
         self.sin_embed = sin
-        # [128] -> [1,1,1,128]
-        # [4096,128] -> [4096,1,1,128]
     else:
         cos = self.cos_embed
         sin = self.sin_embed
@@ -323,12 +321,11 @@ def rope_forward(
     query = query.view(*query.shape[:-1], -1, self.head_size).contiguous()
     key = key.view(*key.shape[:-1], -1, self.head_size).contiguous()
 
-    cos = cos.unsqueeze(-2).unsqueeze(-2)  # 增在倒数第二个位置插入两个维度
+    cos = cos.unsqueeze(-2).unsqueeze(-2)
     sin = sin.unsqueeze(-2).unsqueeze(-2)
 
-    # makesure query's shape [4096, 1, 14, 128]
-    query = query.unsqueeze(1)  # 在第二个位置插入维度
-    key = key.unsqueeze(1)  # 在第二个位置插入维度
+    query = query.unsqueeze(1)
+    key = key.unsqueeze(1)
 
     q_embed, k_embed = torch_npu.npu_apply_rotary_pos_emb(query, key, cos, sin)
     return q_embed.flatten(-2), k_embed.flatten(-2)
