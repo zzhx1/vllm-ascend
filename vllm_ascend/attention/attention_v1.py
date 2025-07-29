@@ -433,14 +433,19 @@ class AscendAttentionBackendImpl(AttentionImpl):
             value = value.contiguous()
 
             if len(kv_cache) > 0:
-                if self.key_cache is None:
+                if ((not self.torchair_graph_enabled
+                     or attn_metadata.attn_state !=
+                     AscendAttentionState.DecodeOnly)
+                        and self.key_cache is None):
                     self.key_cache, self.value_cache = kv_cache[0], kv_cache[1]
                 slots = attn_metadata.slot_mapping
                 if attn_metadata.attn_state == AscendAttentionState.DecodeOnly and self.torchair_graph_enabled:
+                    key_cache = kv_cache[0]
+                    value_cache = kv_cache[1]
                     self.update_kv_cache(key=key,
                                          value=value,
-                                         key_cache=self.key_cache,
-                                         value_cache=self.value_cache,
+                                         key_cache=key_cache,
+                                         value_cache=value_cache,
                                          slot_indices=slots.to(torch.int64))
                 else:
                     torch_npu._npu_reshape_and_cache(
@@ -489,11 +494,9 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 if self.torchair_graph_enabled:
                     # query change to BSND
                     query = query.view(-1, 1, self.num_heads * self.head_size)
-                    # [blocknum, numKvHeads, blocksize, headDims] -> [blocknum, blocksize, numKvHeads * headDims]
-                    key_cache = self.key_cache.view(  # type: ignore
-                        *self.key_cache.shape[:-2], -1)  # type: ignore
-                    value_cache = self.value_cache.view(  # type: ignore
-                        *self.value_cache.shape[:-2], -1)  # type: ignore
+                    # change to [num_blocks, block_size, num_kv_heads * head_size]
+                    key_cache = kv_cache[0].view(*kv_cache[0].shape[:-2], -1)
+                    value_cache = kv_cache[1].view(*kv_cache[1].shape[:-2], -1)
 
                     output = torch_npu.npu_incre_flash_attention(
                         query=query,

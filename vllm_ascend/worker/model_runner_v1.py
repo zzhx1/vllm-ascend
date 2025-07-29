@@ -2024,6 +2024,13 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                                 rope_cache_shape)
                         kv_caches[layer_name] = (nope_cache, rope_cache)
                     else:
+                        # Round up a multiple of 63 to reduce repeated compilation caused by
+                        # num_blocks fluctuation caused by memory differences.
+                        num_blocks = (num_blocks + 62) // 64 * 64
+                        kv_cache_shape = self.attn_backend.get_kv_cache_shape(
+                            num_blocks, kv_cache_spec.block_size,
+                            kv_cache_spec.num_kv_heads,
+                            kv_cache_spec.head_size)
                         num_caches = kv_cache_shape[0]
                         kv_cache_list = []
                         for i in range(num_caches):
