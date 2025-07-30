@@ -11,7 +11,7 @@ def test_qwen25_graph_mode():
 
 
 def test_qwen3_graph_mode():
-    test_qwen_graph_mode("Qwen/Qwen2.5-0.5B-Instruct")
+    test_qwen_graph_mode("Qwen/Qwen3-8B")
 
 
 @patch.dict(os.environ, {"VLLM_ENABLE_GRAPH_MODE": "1"})
@@ -40,7 +40,6 @@ def test_qwen_graph_mode(model) -> None:
             enforce_eager=False,
             enable_expert_parallel=True,
             max_model_len=4096,
-            trust_remote_code=True,
             load_format="dummy",
             gpu_memory_utilization=0.5,
             additional_config={
