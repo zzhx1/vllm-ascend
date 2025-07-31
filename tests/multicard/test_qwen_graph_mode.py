@@ -35,7 +35,7 @@ def test_qwen_graph_mode(model) -> None:
     with VllmRunner(
             model,
             dtype="half",
-            tensor_parallel_size=4,
+            tensor_parallel_size=2,
             distributed_executor_backend="mp",
             enforce_eager=False,
             enable_expert_parallel=True,
