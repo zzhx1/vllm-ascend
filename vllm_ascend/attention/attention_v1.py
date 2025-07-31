@@ -437,11 +437,12 @@ class AscendAttentionBackendImpl(AttentionImpl):
                      or attn_metadata.attn_state !=
                      AscendAttentionState.DecodeOnly)
                         and self.key_cache is None):
-                    self.key_cache, self.value_cache = kv_cache[0], kv_cache[1]
+                    self.key_cache, self.value_cache = kv_cache[0], kv_cache[
+                        1]  # type: ignore[misc]
                 slots = attn_metadata.slot_mapping
                 if attn_metadata.attn_state == AscendAttentionState.DecodeOnly and self.torchair_graph_enabled:
                     key_cache = kv_cache[0]
-                    value_cache = kv_cache[1]
+                    value_cache = kv_cache[1]  # type: ignore[misc]
                     self.update_kv_cache(key=key,
                                          value=value,
                                          key_cache=key_cache,
@@ -496,7 +497,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     query = query.view(-1, 1, self.num_heads * self.head_size)
                     # change to [num_blocks, block_size, num_kv_heads * head_size]
                     key_cache = kv_cache[0].view(*kv_cache[0].shape[:-2], -1)
-                    value_cache = kv_cache[1].view(*kv_cache[1].shape[:-2], -1)
+                    value_cache = kv_cache[1].view(  # type: ignore[misc]
+                        *kv_cache[1].shape[:-2], -1)  # type: ignore[misc]
 
                     output, _ = torch_npu.npu_fused_infer_attention_score(
                         query=query.contiguous(),

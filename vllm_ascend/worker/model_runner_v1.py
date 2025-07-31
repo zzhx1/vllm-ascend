@@ -1892,13 +1892,6 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         if compiled_model:
             return compiled_model
 
-        # import logging
-        # torch._logging.set_logs(dynamo=logging.DEBUG, aot=logging.DEBUG, output_code=True, graph_code=True,
-        #                         recompiles=True)
-        #
-        # import logging
-        # torchair.logger.setLevel(logging.DEBUG)
-
         patch_for_hcom()
         config = torchair.CompilerConfig()
         config.experimental_config.frozen_parameter = True
@@ -1908,8 +1901,6 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         torch.npu.set_compile_mode(jit_compile=False)
         if not self.use_cached_npu_graph:
             npu_backend = torchair.get_npu_backend(compiler_config=config)
-            # ttttodo
-            # return self.model
             self.torchair_compiled_model = torch.compile(
                 self.model,
                 dynamic=True,
