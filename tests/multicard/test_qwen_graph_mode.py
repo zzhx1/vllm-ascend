@@ -2,8 +2,9 @@ import os
 from unittest.mock import patch
 
 from modelscope import snapshot_download  # type: ignore
-from tests.conftest import VllmRunner
 from vllm import SamplingParams
+
+from tests.conftest import VllmRunner
 
 
 @patch.dict(os.environ, {"VLLM_ENABLE_GRAPH_MODE": "1"})
