@@ -29,7 +29,6 @@ def test_qwen25_graph_mode() -> None:
     with VllmRunner(
             model,
             dtype="half",
-            tensor_parallel_size=2,
             distributed_executor_backend="mp",
             enforce_eager=False,
             max_model_len=4096,
@@ -53,7 +52,7 @@ def test_qwen25_graph_mode() -> None:
 
 @patch.dict(os.environ, {"VLLM_ENABLE_GRAPH_MODE": "1"})
 def test_qwen3_graph_mode() -> None:
-    model = "Qwen/Qwen3-8B-A3B"
+    model = "Qwen/Qwen3-30B-A3B"
     example_prompts = [
         "Hello, my name is",
         "The president of the United States is",
@@ -73,7 +72,6 @@ def test_qwen3_graph_mode() -> None:
     with VllmRunner(
             snapshot_download(model),
             dtype="half",
-            tensor_parallel_size=2,
             distributed_executor_backend="mp",
             enforce_eager=False,
             enable_expert_parallel=True,
