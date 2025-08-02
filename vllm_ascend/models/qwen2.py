@@ -111,6 +111,7 @@ class CustomQwen2Attention(Qwen2Attention):
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         if self.torchair_graph_enabled and attn_metadata is not None and attn_metadata.attn_state == AscendAttentionState.DecodeOnly:
+            q, k = self.rotary_emb(positions, q, k, is_prefill=False)
             forward_kwargs = {}
             if envs.VLLM_USE_V1:
                 output_shape = q.shape
