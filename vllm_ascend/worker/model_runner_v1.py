@@ -1396,13 +1396,11 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 self.eplb_updator.take_update_info_from_eplb_process()
 
         with ProfileExecuteDuration().capture_async("post process"): 
-            if self.torchair_graph_enabled and attn_metadata.prefill is None:
+            if self.torchair_graph_enabled and attn_metadata.attn_state == AscendAttentionState.DecodeOnly:
                 logits = self.model.compute_logits(hidden_states, None)
                 logits = logits[sample_indices]
             else:
                 logits = self.model.compute_logits(hidden_states[sample_indices], None)
-            if self.use_eagle:
-                attn_metadata = self.get_eagle_atten_dict(scheduler_output)
             # Apply structured output bitmasks if present
             if scheduler_output.grammar_bitmask is not None:
                 logits = self.apply_grammar_bitmask(scheduler_output, logits)

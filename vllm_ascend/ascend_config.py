@@ -51,6 +51,7 @@ class AscendConfig:
             "enable_prefill_optimizations", False)
         self.lmhead_tensor_parallel_size = additional_config.get(
             "lmhead_tensor_parallel_size", None)
+        
         if self.lmhead_tensor_parallel_size is not None:
             logger.info(f"Enable lmhead_tensor_parallel_size={self.lmhead_tensor_parallel_size} in pure DP scenario")
             assert(
