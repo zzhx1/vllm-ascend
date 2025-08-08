@@ -376,3 +376,8 @@ def set_graph_params(aclgraph_capture_sizes: set[int]):
 
 def get_graph_params():
     return _graph_params
+
+def _enable_lmhead_tp() -> bool:
+    if get_ascend_config().lmhead_tensor_parallel_size is not None:
+        return True
+    return False

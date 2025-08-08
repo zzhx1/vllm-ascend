@@ -135,6 +135,12 @@ class NPUPlatform(Platform):
                 parallel_config.world_size_across_dp //
                 parallel_config.expert_tensor_parallel_size)
 
+        if parallel_config:
+            # assign lmhead tensor parallel size
+            parallel_config.lmhead_tensor_parallel_size = (
+                ascend_config.lmhead_tensor_parallel_size
+            )
+
         if model_config is None:
             logger.warning("Model config is missing. This may indicate "
                            "that we are running a test case")
