@@ -23,6 +23,7 @@ def model_parallel_initialized():
 
 def init_ascend_model_parallel(
     expert_parallel_size: int = 1,
+    lmhead_tensor_parallel_size: Optional[int] = None,
     backend: Optional[str] = None,
 ):
     if model_parallel_initialized():
@@ -45,7 +46,6 @@ def init_ascend_model_parallel(
                                      backend,
                                      group_name="mc2")
     
-    lmhead_tensor_parallel_size = parallel_config.lmhead_tensor_parallel_size
     if lmhead_tensor_parallel_size is not None:
         group_ranks = []
         global _LMTP

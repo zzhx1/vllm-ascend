@@ -34,7 +34,7 @@ from torchair.scope import super_kernel as _super_kernel
 from vllm.logger import logger
 
 import vllm_ascend.envs as envs
-
+from vllm_ascend.ascend_config import get_ascend_config
 try:
     # Recent release of torchair has moved these ops to `.scope`.
     from torchair.scope import npu_stream_switch as _npu_stream_switch
