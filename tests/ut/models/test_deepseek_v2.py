@@ -27,7 +27,7 @@ from vllm_ascend.models.deepseek_v2 import (
     CustomDeepseekV2MLP, CustomDeepseekV2MoE,
     CustomDeepseekV2RowParallelLinear,
     CustomDeepseekV2RowParallelLinearReplaceAllreduce,
-    CustomDeepseekV2SiluAndMul)
+    CustomDeepseekV2SiluAndMul, CustomLogitsProcessor, CustomParallelLMHead)
 
 
 @pytest.fixture
@@ -317,3 +317,19 @@ def test_custom_deepseek_v2_for_causal_lm(mock_distributed, vllm_config):
     ):
         loaded = model.load_weights(weights)
         assert loaded is not None
+
+
+def test_custom_deepseek_v2_lmhead(mock_distributed, vllm_config):
+    model = CustomDeepseekV2ForCausalLM(vllm_config=vllm_config)
+    lmhead = CustomParallelLMHead(model.model.config.vocab_size,
+                                  model.model.config.hidden_size)
+    logits_processor = CustomLogitsProcessor(model.model.config.vocab_size)
+
+    input_ids = torch.randint(0, 10000, (2, 4))
+    positions = torch.arange(4).repeat(2, 1)
+    with patch.object(model.model,
+                      "forward",
+                      return_value=torch.randn(2, 4, 128)):
+        output = model(input_ids, positions)
+        logits = logits_processor(lmhead, output)
+    assert logits.shape == (2, 4, 10000)
