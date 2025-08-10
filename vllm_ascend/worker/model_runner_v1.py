@@ -58,7 +58,7 @@ from vllm.sampling_params import SamplingType
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import GenerationTask, SupportedTask
 from vllm.utils import (STR_DTYPE_TO_TORCH_DTYPE, DeviceMemoryProfiler,
-                        LazyLoader, cdiv)
+                        LazyLoader, cdiv, _enable_lmhead_tp)
 from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig,
                                         KVCacheSpec)
 from vllm.v1.outputs import (EMPTY_MODEL_RUNNER_OUTPUT, LogprobsTensors,
@@ -1370,6 +1370,15 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         aux_hidden_states = None
         if self.use_aux_hidden_state_outputs:
             hidden_states, aux_hidden_states = hidden_states
+        
+        if _enable_lmhead_tp(): # 
+            if not with_prefill:
+                max_num_reqs_across_dp = padded_num_tokens_across_dp
+            else:
+                max_num_reqs_across_dp = self.max_num_reqs
+            sample_indices = nn.functional.pad(
+                sample_indices,
+                (0, max_num_reqs_across_dp - sample_indices.shape[0]))
 
         return (attn_metadata, hidden_states, spec_decode_metadata, positions,
                 total_num_scheduled_tokens, logits_indices, aux_hidden_states,
@@ -1667,14 +1676,9 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                                       num_scheduled_tokens_np,
                                       finished_sending, finished_recving,
                                       kv_connector_output)
-                # temporary disable
-                # sample_hidden_states = hidden_states[logits_indices] 
-                # logits = self.model.compute_logits(sample_hidden_states, None)
-                if self.torchair_graph_enabled and attn_metadata.prefill is None:
-                    logits = self.model.compute_logits(hidden_states, None)
-                    logits = logits[sample_indices]
-                else:
-                    logits = self.model.compute_logits(hidden_states[sample_indices], None)
+                sample_hidden_states = hidden_states[logits_indices]
+                logits = self.model.compute_logits(sample_hidden_states, None)
+
             if broadcast_pp_output:
                 model_output_broadcast_data = {
                     "logits": logits.contiguous(),
@@ -1692,11 +1696,15 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             # Sample the next token and get logprobs if needed.
             sampling_metadata = self.input_batch.sampling_metadata
             if spec_decode_metadata is None:
+                if _enable_lmhead_tp():
+                    logits = logits[:self.input_batch.num_reqs]
                 sampler_output = self.sampler(
                     logits=logits,
                     sampling_metadata=sampling_metadata,
                 )
             else:
+                if _enable_lmhead_tp():
+                    logits = logits[:len(spec_decode_metadata.logits_indices)]
                 # When indexing with a tensor (bonus_logits_indices), PyTorch
                 # creates a new tensor with separate storage from the original
                 # logits tensor. This means any in-place operations on bonus_logits
