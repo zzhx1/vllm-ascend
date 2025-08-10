@@ -56,7 +56,7 @@ from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.ops.fused_moe import AscendFusedMoE
 from vllm_ascend.ops.sequence_parallel import (MetadataForPadding,
                                                init_metadata_for_sp)
-
+from vllm_ascend.ops.vocab_parallel_embedding import CustomLogitsProcessor, CustomParallelLMHead
 
 class AscendQwen3MoeSparseMoeBlock(nn.Module):
     top_k: int
@@ -474,13 +474,13 @@ class CustomQwen3MoeForCausalLM(Qwen3MoeForCausalLM):
         self.quant_config = quant_config
         self.model = AscendQwen3MoeModel(vllm_config=vllm_config,
                                          prefix=maybe_prefix(prefix, "model"))
-        self.lm_head = ParallelLMHead(config.vocab_size,
+        self.lm_head = CustomParallelLMHead(config.vocab_size,
                                       config.hidden_size,
                                       quant_config=quant_config,
                                       prefix=maybe_prefix(prefix, "lm_head"))
         if self.config.tie_word_embeddings:
             self.lm_head.weight = self.model.embed_tokens.weight
-        self.logits_processor = LogitsProcessor(config.vocab_size)
+        self.logits_processor = CustomLogitsProcessor(config.vocab_size)
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors)
         self.enable_sequence_parallelism = vllm_config.compilation_config.pass_config.enable_sequence_parallelism

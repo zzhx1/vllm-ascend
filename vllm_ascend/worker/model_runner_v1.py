@@ -56,7 +56,7 @@ from vllm.multimodal.utils import group_mm_inputs_by_modality
 from vllm.sampling_params import SamplingType
 from vllm.sequence import IntermediateTensors
 from vllm.utils import (STR_DTYPE_TO_TORCH_DTYPE, DeviceMemoryProfiler,
-                        LayerBlockType, LazyLoader, cdiv, _enable_lmhead_tp)
+                        LayerBlockType, LazyLoader, cdiv)
 from vllm.v1.core.encoder_cache_manager import compute_encoder_budget
 from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig,
                                         KVCacheSpec)
@@ -85,7 +85,7 @@ from vllm_ascend.eplb.eplb_updator import EplbUpdator
 from vllm_ascend.multistream.ms_split import compute_split_seq_index
 from vllm_ascend.platform import NPUPlatform
 from vllm_ascend.sample.rejection_sampler import AscendRejectionSampler
-from vllm_ascend.utils import ProfileExecuteDuration
+from vllm_ascend.utils import ProfileExecuteDuration, _enable_lmhead_tp
 from vllm_ascend.worker.mtp_proposer_v1 import MtpProposer
 
 if TYPE_CHECKING:
