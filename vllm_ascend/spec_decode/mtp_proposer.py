@@ -105,7 +105,7 @@ class MtpProposer(Proposer):
                 self.model))
         process_weights_after_loading(self.model, draft_model_config,
                                       target_device)
-                                      
+
         # use main model's embedding and LMhead
         self.model.model.embed_tokens = main_model.model.embed_tokens
         for layer_module in self.model.model.layers.values():
