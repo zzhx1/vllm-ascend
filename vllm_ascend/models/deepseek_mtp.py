@@ -130,7 +130,7 @@ class CustomDeepSeekMultiTokenPredictor(DeepSeekMultiTokenPredictor):
             for idx in range(self.mtp_start_layer_idx,
                              self.mtp_start_layer_idx + self.num_mtp_layers)
         })
-        # Mapped to the main model's embedding
+        # Mapped to the main model's VocabEmbedding
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
