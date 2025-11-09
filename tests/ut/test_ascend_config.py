@@ -359,5 +359,6 @@ class TestAscendConfig(TestBase):
             }
             test_vllm_config.parallel_config = ParallelConfig(
                 data_parallel_size=4, tensor_parallel_size=1)
-            test_vllm_config.model_config.enforce_eager = True
+            test_vllm_config.model_config = ModelConfig(
+                enforce_eager=True)
             init_ascend_config(test_vllm_config)
