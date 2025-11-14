@@ -11,7 +11,7 @@ from vllm_ascend.attention.mla_v1 import (AscendMLABackend,
                                           AscendMLAImpl, AscendMLAMetadata,
                                           AscendMLAMetadataBuilder,
                                           AscendMLAPrefillMetadata)
-
+from vllm_ascend.ascend_config import init_ascend_config
 
 class TestAscendMLABackend(TestBase):
 
@@ -338,7 +338,8 @@ class TestAscendMLAImpl(TestBase):
         model_config.dtype = torch.float16
         vllm_config.model_config = model_config
         get_current_vllm_config.return_value = vllm_config
-
+        init_ascend_config(ascend_config)
+    
         num_heads = 256
         head_size = 1024
         scale = 0.1
