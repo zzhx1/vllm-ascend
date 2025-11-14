@@ -5,13 +5,14 @@ from vllm.distributed.parallel_state import GroupCoordinator
 from vllm.model_executor.layers.linear import LinearBase
 
 from tests.ut.base import TestBase
+from vllm_ascend.ascend_config import init_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.mla_v1 import (AscendMLABackend,
                                           AscendMLADecodeMetadata,
                                           AscendMLAImpl, AscendMLAMetadata,
                                           AscendMLAMetadataBuilder,
                                           AscendMLAPrefillMetadata)
-from vllm_ascend.ascend_config import init_ascend_config
+
 
 class TestAscendMLABackend(TestBase):
 
@@ -339,7 +340,7 @@ class TestAscendMLAImpl(TestBase):
         vllm_config.model_config = model_config
         get_current_vllm_config.return_value = vllm_config
         init_ascend_config(ascend_config)
-    
+
         num_heads = 256
         head_size = 1024
         scale = 0.1
