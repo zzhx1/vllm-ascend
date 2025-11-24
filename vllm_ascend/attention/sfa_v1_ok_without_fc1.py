@@ -22,7 +22,7 @@ from vllm_ascend.ops.weight_prefetch import maybe_npu_prefetch
 from vllm_ascend.utils import (ACL_FORMAT_FRACTAL_ND, ACL_FORMAT_FRACTAL_NZ,
                                is_enable_nz)
 from vllm_ascend.worker.npu_input_batch import InputBatch
-from vllm_ascend.utils import dispose_tensor, dispose_layer, replace_layer
+from vllm_ascend.utils import dispose_tensor
 from vllm_ascend.distributed.sfa_sp_context import (set_sfa_sp_context, get_sfa_sp_context, check_diff)
 from vllm_ascend.ops.shared_weight_layer import (
     post_process_after_loading_for_shared_weight_series,
@@ -277,33 +277,43 @@ class AscendSFAImpl(MLAAttentionImpl):
         if self.enable_sfa_cp:
             self.local_num_heads = self.num_heads * self.tp_size
             vllm_config = get_current_vllm_config()
-
             # Dispose tensor from the original q_proj
-            dispose_layer(self.q_proj)
+            for attr_name in dir(self.q_proj):
+                attr_value = getattr(self.q_proj, attr_name)
+                if isinstance(attr_value, torch.Tensor):
+                    dispose_tensor(attr_value)
             # Construct the new q_proj using ReplicatedLinear
             new_q_proj = ReplicatedLinear(
                 self.q_lora_rank,
-                self.local_num_heads * self.qk_head_dim,
+                self.num_heads * self.qk_head_dim * self.tp_size,
                 bias=False,
                 quant_config=vllm_config.quant_config,
                 prefix=self.q_proj.prefix)
             # Replace the q_proj with the new one
-            replace_layer(self.q_proj, new_q_proj)
+            self.q_proj.__class__ = new_q_proj.__class__
+            self.q_proj.__dict__ = new_q_proj.__dict__
 
             # Dispose tensor from the original kv_b_proj
-            dispose_layer(self.kv_b_proj)
+            for attr_name in dir(self.kv_b_proj):
+                attr_value = getattr(self.kv_b_proj, attr_name)
+                if isinstance(attr_value, torch.Tensor):
+                    dispose_tensor(attr_value)
             # Construct the new kv_b_proj using ReplicatedLinear
             new_kv_b_proj = ReplicatedLinear(
                 self.kv_lora_rank,
-                self.local_num_heads * (self.qk_nope_head_dim + self.v_head_dim),
+                self.num_heads * self.tp_size * (self.qk_nope_head_dim + self.v_head_dim),
                 bias=False,
                 quant_config=vllm_config.quant_config,
                 prefix=self.kv_b_proj.prefix)
             # Replace the kv_b_proj with the new one
-            replace_layer(self.kv_b_proj, new_kv_b_proj)
+            self.kv_b_proj.__class__ = new_kv_b_proj.__class__
+            self.kv_b_proj.__dict__ = new_kv_b_proj.__dict__
 
             # Dispose tensor from the original o_proj
-            dispose_layer(self.o_proj)
+            for attr_name in dir(self.o_proj):
+                attr_value = getattr(self.o_proj, attr_name)
+                if isinstance(attr_value, torch.Tensor):
+                    dispose_tensor(attr_value)
             # Construct the new o_proj using ReplicatedLinear
             config = vllm_config.model_config.hf_config
             new_o_proj = ReplicatedLinear(
@@ -313,14 +323,10 @@ class AscendSFAImpl(MLAAttentionImpl):
                 quant_config=vllm_config.quant_config,
                 prefix=self.o_proj.prefix)
             # Replace the o_proj with the new one
-            replace_layer(self.o_proj, new_o_proj)
+            self.o_proj.__class__ = new_o_proj.__class__
+            self.o_proj.__dict__ = new_o_proj.__dict__
 
             from vllm_ascend.distributed.parallel_state import get_shared_weight_group
-            register_layer_to_shared_weight_series(
-                series_name="q_proj",
-                group=get_shared_weight_group(),
-                layer=self.q_proj,
-                prefetch_step=1)
             register_layer_to_shared_weight_series(
                 series_name="o_proj",
                 group=get_shared_weight_group(),
@@ -401,13 +407,10 @@ class AscendSFAImpl(MLAAttentionImpl):
         # Waiting for BMM NZ support
         # self.W_UV.data = torch_npu.npu_format_cast(self.W_UV.data, 29)
         # self.W_UK_T.data = torch_npu.npu_format_cast(self.W_UK_T.data, 29)
-        # Dispose kv_b_proj since it is replaced by W_UV and W_UK_T to save memory
-        dispose_layer(self.kv_b_proj)
 
         if self.enable_sfa_cp:
-            post_process_after_loading_for_shared_weight_series(self.q_proj)
             post_process_after_loading_for_shared_weight_series(self.o_proj)
-            
+
     def _v_up_proj(self, x):
         if self.W_UV.shape[0] * self.W_UV.shape[1] < 65536:
             x = x.view(-1, self.local_num_heads, self.kv_lora_rank)
@@ -446,7 +449,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         sin: torch.Tensor,
         kv_cache: Tuple,
         slots: torch.Tensor,
-        slots_cp: Optional[torch.Tensor],
+        slots_cp: torch.Tensor,
     ):
         B = kv_no_split.shape[0]
         N = self.num_kv_heads
@@ -457,7 +460,6 @@ class AscendSFAImpl(MLAAttentionImpl):
         cache_mode = "PA_NZ" if self.enable_kv_nz else "PA"
         #k_pe, k_nope, _, _ 
         if self.enable_sfa_cp:
-            assert slots_cp is not None
             _, _, k_pe, k_nope = torch_npu.npu_kv_rmsnorm_rope_cache(
                 kv_no_split,
                 self.kv_a_layernorm.weight,
@@ -518,10 +520,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         if attn_metadata is None:
             # Profiling run.
             if self.enable_sfa_cp:
-                from vllm.forward_context import get_forward_context
-                if not get_forward_context().in_profile_run:
-                    reach_layer_for_shared_weight_series(self.q_proj)
-                    reach_layer_for_shared_weight_series(self.o_proj)
+                reach_layer_for_shared_weight_series(self.o_proj)
             return output.fill_(0)
         has_prefill = attn_metadata.has_prefill
         num_actual_tokens = attn_metadata.num_actual_tokens
@@ -530,8 +529,11 @@ class AscendSFAImpl(MLAAttentionImpl):
         sfa_sp_context = None
         if self.enable_sfa_cp:
             need_gather_q_kv = False
-            set_sfa_sp_context(hidden_states, attn_metadata.num_actual_tokens)
+            set_sfa_sp_context(hidden_states)
             sfa_sp_context = get_sfa_sp_context()
+            if sfa_sp_context.pad_size > 0:
+                hidden_states = nn.functional.pad(hidden_states, (0, 0, 0, sfa_sp_context.pad_size))
+            hidden_states = hidden_states[sfa_sp_context.local_start:sfa_sp_context.local_end_with_pad]
 
         # Inputs and outputs may be padded for CUDA graphs
         output_padded = output
@@ -571,17 +573,11 @@ class AscendSFAImpl(MLAAttentionImpl):
             slot_mapping_cp = slot_mapping[sfa_sp_context.local_start:sfa_sp_context.local_end_with_pad]
 
         self.exec_kv(kv_no_split, cos, sin, kv_cache, slot_mapping, slot_mapping_cp)
-        self.indexer_k(x=hidden_states,
-                       kv_cache=kv_cache,
-                       cos=cos,
-                       sin=sin,
-                       slot_mapping=slot_mapping,
-                       need_gather_q_kv=need_gather_q_kv)
         if self.enable_sfa_cp:
-            reach_layer_for_shared_weight_series(self.q_proj)
             reach_layer_for_shared_weight_series(self.o_proj)
 
-        ql_nope, q_pe = self._q_proj_and_k_up_proj(q_c)
+        ql_nope, q_pe = \
+            self._q_proj_and_k_up_proj(q_c)
         q_pe = self.rope_single(q_pe, cos, sin)
         
         cum_query_lens = attn_metadata.cum_query_lens
@@ -621,11 +617,12 @@ class AscendSFAImpl(MLAAttentionImpl):
                                            sin=sin,
                                            actual_seq_lengths_query=actual_seq_lengths_query,
                                            actual_seq_lengths_key=actual_seq_lengths_key,
+                                           slot_mapping=slot_mapping,
                                            need_gather_q_kv=need_gather_q_kv)
         attn_output = torch.ops.custom.npu_sparse_flash_attention(
             query=ql_nope,
-            key=kv_cache[0],  # k_nope,
-            value=kv_cache[0],  # k_nope,
+            key=kv_cache[0],#k_nope,
+            value=kv_cache[0],#k_nope,
             sparse_indices=topk_indices,
             scale_value=self.scale,
             sparse_block_size=1,
@@ -633,7 +630,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             actual_seq_lengths_query=actual_seq_lengths_query,
             actual_seq_lengths_kv=actual_seq_lengths_key,
             query_rope=q_pe,
-            key_rope=kv_cache[1],  # k_pe,
+            key_rope=kv_cache[1],#k_pe,
             layout_query="TND",
             layout_kv="PA_BSND",
             sparse_mode=3,
@@ -643,20 +640,41 @@ class AscendSFAImpl(MLAAttentionImpl):
                            dependency=attn_output,
                            max_size=MAX_O_PROJ_PREFETCH_SIZE,
                            enabled=self.enable_prefetch)
-        output[...] = self.o_proj(attn_output)[0]
+        if self.enable_sfa_cp:
+            output_full = get_tp_group().all_gather(self.o_proj(attn_output)[0], 0)
+            output[...] = output_full[:num_actual_tokens]
+        else:
+            output[...] = self.o_proj(attn_output)[0]
         return output_padded
 
-    def indexer_k(
+    def indexer_select(
         self,
         x: torch.Tensor,
+        qr: torch.Tensor,
         kv_cache: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        attn_metadata: M,
         cos: torch.Tensor,
         sin: torch.Tensor,
+        actual_seq_lengths_query: torch.Tensor,
+        actual_seq_lengths_key: torch.Tensor,
         slot_mapping: torch.Tensor,
         need_gather_q_kv: bool = False,
     ):
+        cos_q, sin_q = cos, sin
         cos = cos.view(-1, 1, 1, self.qk_rope_head_dim)
         sin = sin.view(-1, 1, 1, self.qk_rope_head_dim)
+
+        # q process in new stream
+        q, _ = self.wq_b(qr)  # [b,s,1536] @ [1536,64*128] = [b,s,64*128]
+        q = q.view(-1, self.n_head, self.head_dim)  # [b,s,64,128]
+        q_pe, q_nope = torch.split(
+            q, [self.qk_rope_head_dim, self.head_dim - self.qk_rope_head_dim],
+            dim=-1)  # [b,s,64,64+64]
+
+        q_pe = q_pe.unsqueeze(2)
+        q_pe = torch_npu.npu_interleave_rope(q_pe, cos_q, sin_q)
+        q_pe = q_pe.squeeze(2)
+        q = torch.cat([q_pe, q_nope], dim=-1)  # [b*s,64,128]
 
         k_proj, _ = self.wk(x)  # [b,s,7168] @ [7168,128] = [b,s,128]
         k_proj = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(
@@ -679,32 +697,6 @@ class AscendSFAImpl(MLAAttentionImpl):
                                                  -1, 1),
                                              k.view(-1,
                                                     k.shape[-1]))  # b, s, n, d
-
-    def indexer_select(
-        self,
-        x: torch.Tensor,
-        qr: torch.Tensor,
-        kv_cache: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-        attn_metadata: M,
-        cos: torch.Tensor,
-        sin: torch.Tensor,
-        actual_seq_lengths_query: torch.Tensor,
-        actual_seq_lengths_key: torch.Tensor,
-        need_gather_q_kv: bool = False,
-    ):
-        cos_q, sin_q = cos, sin
-
-        # q process in new stream
-        q, _ = self.wq_b(qr)  # [b,s,1536] @ [1536,64*128] = [b,s,64*128]
-        q = q.view(-1, self.n_head, self.head_dim)  # [b,s,64,128]
-        q_pe, q_nope = torch.split(
-            q, [self.qk_rope_head_dim, self.head_dim - self.qk_rope_head_dim],
-            dim=-1)  # [b,s,64,64+64]
-
-        q_pe = q_pe.unsqueeze(2)
-        q_pe = torch_npu.npu_interleave_rope(q_pe, cos_q, sin_q)
-        q_pe = q_pe.squeeze(2)
-        q = torch.cat([q_pe, q_nope], dim=-1)  # [b*s,64,128]
 
         weights, _ = self.weights_proj(x)
         weights = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(

@@ -19,6 +19,7 @@ _LMTP: Optional[GroupCoordinator] = None
 _P_TP: Optional[GroupCoordinator] = None
 _FLASHCOMM2_OTP: Optional[GroupCoordinator] = None
 _FLASHCOMM2_ODP: Optional[GroupCoordinator] = None
+_SHARED_WEIGHT: Optional[GroupCoordinator] = None
 
 
 def get_mc2_group() -> GroupCoordinator:
@@ -46,6 +47,12 @@ def get_flashcomm2_odp_group() -> GroupCoordinator:
     assert _FLASHCOMM2_ODP is not None, (
         "output data parallel group for flashcomm2 is not initialized")
     return _FLASHCOMM2_ODP
+
+def get_shared_weight_group() -> GroupCoordinator:
+    assert _SHARED_WEIGHT is not None, (
+        "output shared weight parallel group for flashcomm2 is not initialized"
+    )
+    return _SHARED_WEIGHT
 
 
 def get_mlp_tp_group() -> GroupCoordinator:
@@ -221,6 +228,15 @@ def init_ascend_model_parallel(parallel_config: ParallelConfig, ):
                 backend,
                 group_name="flashcomm2_odp")
 
+    # If SFA CP is enabled, we will create one world group for shared weights.
+    if get_ascend_config().enable_sfa_cp:
+        global _SHARED_WEIGHT
+        group_ranks = [list(range(torch.distributed.get_world_size()))]
+        _SHARED_WEIGHT = init_model_parallel_group(
+            group_ranks,
+            get_world_group().local_rank,
+            backend,
+            group_name="flashcomm2_o_shared")
 
 def get_mlp_tensor_model_parallel_world_size():
     """Return world size for the tensor model parallel group."""
@@ -269,3 +285,8 @@ def destroy_ascend_model_parallel():
     ).flashcomm2_oproj_tensor_parallel_size != 1:
         _FLASHCOMM2_ODP.destroy()
         _FLASHCOMM2_ODP = None
+
+    global _SHARED_WEIGHT
+    if _SHARED_WEIGHT:
+        _SHARED_WEIGHT.destroy()
+    _SHARED_WEIGHT = None

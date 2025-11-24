@@ -84,7 +84,9 @@ class AscendScheduler(Scheduler):
         self._initialize_common()
 
     def schedule(self) -> SchedulerOutput:
+        print("===scheduler111",flush=True)
         if self.scheduler_config.chunked_prefill_enabled:
+            print("===scheduler222",flush=True)
             return super().schedule()
         scheduled_new_reqs: list[Request] = []
         scheduled_resumed_reqs: list[Request] = []
