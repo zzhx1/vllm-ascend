@@ -3,8 +3,9 @@ from typing import Optional
 import torch
 from vllm.config import ParallelConfig, get_current_vllm_config
 from vllm.distributed.parallel_state import (GroupCoordinator, get_dp_group,
-                                             get_tp_group, get_world_group,
-                                             init_model_parallel_group, get_pp_group)
+                                             get_pp_group, get_tp_group,
+                                             get_world_group,
+                                             init_model_parallel_group)
 
 import vllm_ascend.envs as envs_ascend
 from vllm_ascend.ascend_config import get_ascend_config
@@ -198,11 +199,13 @@ def init_ascend_model_parallel(parallel_config: ParallelConfig, ):
         if flashcomm2_otp_size > 1:
             otp_group_ranks = []
             odp_group_ranks: list[list[int]] = [
-                [] for _ in range(flashcomm2_otp_size * global_dp_size * global_pp_size)
+                [] for _ in range(flashcomm2_otp_size * global_dp_size *
+                                  global_pp_size)
             ]
             for dp_group_index in range(global_dp_size):
                 for pp_group_index in range(global_pp_size):
-                    tp_base_rank = (dp_group_index * global_pp_size + pp_group_index) * global_tp_size
+                    tp_base_rank = (dp_group_index * global_pp_size +
+                                    pp_group_index) * global_tp_size
                     for i in range(num_fc2_oproj_tensor_parallel_groups):
                         ranks = []
                         for j in range(flashcomm2_otp_size):
@@ -210,8 +213,11 @@ def init_ascend_model_parallel(parallel_config: ParallelConfig, ):
                             assert tp_local_rank < global_tp_size
                             global_rank = tp_base_rank + tp_local_rank
                             ranks.append(global_rank)
-                            odp_group_index = (dp_group_index * global_pp_size + pp_group_index) * flashcomm2_otp_size + j
-                            odp_group_ranks[odp_group_index].append(global_rank)
+                            odp_group_index = (
+                                dp_group_index * global_pp_size +
+                                pp_group_index) * flashcomm2_otp_size + j
+                            odp_group_ranks[odp_group_index].append(
+                                global_rank)
                         otp_group_ranks.append(ranks)
 
             _FLASHCOMM2_OTP = init_model_parallel_group(
