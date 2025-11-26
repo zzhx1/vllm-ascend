@@ -1,6 +1,6 @@
-import pytest
 from unittest.mock import MagicMock, patch
 
+import pytest
 import torch
 from vllm.config import CacheConfig, ModelConfig, SchedulerConfig, VllmConfig
 from vllm.distributed.parallel_state import GroupCoordinator
@@ -20,9 +20,9 @@ from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
 def mock_distributed():
     """Fixture to mock distributed related dependencies."""
     with patch('vllm.distributed.parallel_state.get_dcp_group') as mock_get_dcp_group, \
-         patch('vllm.distributed.parallel_state._DCP', 
+         patch('vllm.distributed.parallel_state._DCP',
                new_callable=lambda: MagicMock(spec=GroupCoordinator)) as mock_dcp, \
-         patch("vllm.distributed.get_decode_context_model_parallel_world_size", 
+         patch("vllm.distributed.get_decode_context_model_parallel_world_size",
                return_value=1) as mock_get_dcp_size, \
          patch('vllm.distributed.parallel_state._TP',
                new_callable=lambda: MagicMock(spec=GroupCoordinator)) as mock_tp, \
@@ -39,22 +39,22 @@ def mock_distributed():
          patch("torch.ops.vllm.maybe_all_gather_and_maybe_unpad") as mock_maybe_all_gather, \
          patch("vllm_ascend.attention.mla_v1.maybe_npu_prefetch") as mock_npu_prefetch, \
          patch("torch_npu.npu_kv_rmsnorm_rope_cache") as mock_kv_rmsnorm_rope_cache:
-        
+
         # Setup mock objects
         mock_dcp.world_size = 1
         mock_dcp.rank_in_group = 0
         mock_dcp.device_group = MagicMock()
-        
+
         mock_tp.world_size = 2
         mock_tp.rank_in_group = MagicMock()
         mock_tp.device_group = MagicMock()
-        
+
         dcp_group = MagicMock(spec=GroupCoordinator)
         dcp_group.rank_in_group = 0
         dcp_group.world_size = 1
         dcp_group.device_group = MagicMock()
         mock_get_dcp_group.return_value = dcp_group
-        
+
         # Setup default vllm config
         vllm_config = MagicMock()
         speculative_config = MagicMock()
@@ -64,14 +64,14 @@ def mock_distributed():
         model_config.dtype = torch.float16
         vllm_config.model_config = model_config
         mock_get_vllm_config.return_value = vllm_config
-        
+
         # Setup default ascend config
         ascend_config = MagicMock()
         mock_get_ascend_config.return_value = ascend_config
-        
+
         # Setup forward context
         mock_get_forward_context.return_value = MagicMock(capturing=False)
-        
+
         yield {
             'mock_get_dcp_group': mock_get_dcp_group,
             'mock_dcp': mock_dcp,
@@ -81,7 +81,8 @@ def mock_distributed():
             'mock_get_vllm_config': mock_get_vllm_config,
             'mock_get_ascend_config': mock_get_ascend_config,
             'mock_get_forward_context': mock_get_forward_context,
-            'mock_npu_fused_infer_attention_score': mock_npu_fused_infer_attention_score,
+            'mock_npu_fused_infer_attention_score':
+            mock_npu_fused_infer_attention_score,
             'mock_v_up_proj': mock_v_up_proj,
             'mock_npu_paged_cache_load': mock_npu_paged_cache_load,
             'mock_npu_ring_mla': mock_npu_ring_mla,
@@ -300,7 +301,8 @@ class TestAscendMLAMetadataBuilder(TestBase):
             builder.chunked_prefill_enabled,
             mock_vllm_config.scheduler_config.chunked_prefill_enabled)
 
-    def test_ascend_mla_metadata_builder_build_full_graph(self, mock_distributed):
+    def test_ascend_mla_metadata_builder_build_full_graph(
+            self, mock_distributed):
         mock_vllm_config = MagicMock()
         mock_vllm_config.model_config.max_model_len = 1024
         mock_vllm_config.model_config.get_head_size.return_value = 64
@@ -827,23 +829,25 @@ class TestAscendMLAImpl(TestBase):
         metadata.decode = MagicMock()
         metadata.decode.block_table = MagicMock()
         metadata.decode.seq_lens = 10
-        mock_distributed['mock_npu_fused_infer_attention_score'].return_value = [
-            torch.randn(num_tokens, self.impl.num_heads,
-                        self.impl.kv_lora_rank), None
-        ]
-        mock_distributed['mock_v_up_proj'].return_value = torch.randn(num_tokens,
-                                                self.impl.num_heads,
-                                                self.impl.v_head_dim)
+        mock_distributed[
+            'mock_npu_fused_infer_attention_score'].return_value = [
+                torch.randn(num_tokens, self.impl.num_heads,
+                            self.impl.kv_lora_rank), None
+            ]
+        mock_distributed['mock_v_up_proj'].return_value = torch.randn(
+            num_tokens, self.impl.num_heads, self.impl.v_head_dim)
         result = self.impl._forward_decode(q_nope, q_pe, k_nope, k_pe,
                                            block_size, metadata)
         self.assertEqual(result.shape[0], num_tokens)
         self.assertEqual(result.shape[1], self.impl.num_heads)
         self.assertEqual(result.shape[2], self.impl.v_head_dim)
         mock_distributed['mock_v_up_proj'].assert_called_once()
-        mock_distributed['mock_npu_fused_infer_attention_score'].assert_called_once()
+        mock_distributed[
+            'mock_npu_fused_infer_attention_score'].assert_called_once()
 
     def test_mla_preprocess(self, mock_distributed):
-        mock_distributed['mock_maybe_all_gather'].side_effect = lambda x, label: x
+        mock_distributed[
+            'mock_maybe_all_gather'].side_effect = lambda x, label: x
         batch_size = 4
         seq_len = 8
         hidden_size = 1024
@@ -984,9 +988,10 @@ class TestAscendMLAImpl(TestBase):
         attn_metadata.decode.seq_lens_list = MagicMock()
         self.impl.enable_kv_nz = True
 
-        mock_distributed['mock_npu_fused_infer_attention_score'].return_value = [
-            torch.randn(B, N, self.impl.kv_lora_rank), None
-        ]
+        mock_distributed[
+            'mock_npu_fused_infer_attention_score'].return_value = [
+                torch.randn(B, N, self.impl.kv_lora_rank), None
+            ]
         result = self.impl._forward_decode(q_nope, q_pe, k_nope, k_pe, BS,
                                            attn_metadata)
 
