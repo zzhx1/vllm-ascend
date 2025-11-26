@@ -238,11 +238,24 @@ def init_ascend_model_parallel(parallel_config: ParallelConfig, ):
         if flashcomm2_o_shared_enabled():
             global _FLASHCOMM2_O_SHARED
             _FLASHCOMM2_O_SHARED = _FLASHCOMM2_ODP
+
             if global_dp_size > 1:
-                group_ranks = [[] for _ in range(flashcomm2_otp_size)]
-                for i in range(world_size):
-                    group_ranks[i % global_tp_size * flashcomm2_otp_size //
-                                global_tp_size].append(i)
+                num_fc2_oproj_tensor_parallel_groups = global_tp_size // flashcomm2_otp_size
+                group_ranks = []
+
+                for pp_idx in range(global_pp_size):
+                    for j in range(flashcomm2_otp_size):
+                        group = []
+                        for dp_idx in range(global_dp_size):
+                            base = (dp_idx * global_pp_size +
+                                    pp_idx) * global_tp_size
+                            for i in range(
+                                    num_fc2_oproj_tensor_parallel_groups):
+                                tp_local = i + j * num_fc2_oproj_tensor_parallel_groups
+                                global_rank = base + tp_local
+                                group.append(global_rank)
+                        group_ranks.append(group)
+
                 _FLASHCOMM2_O_SHARED = init_model_parallel_group(
                     group_ranks,
                     get_world_group().local_rank,
