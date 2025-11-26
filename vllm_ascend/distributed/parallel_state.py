@@ -204,8 +204,10 @@ def init_ascend_model_parallel(parallel_config: ParallelConfig, ):
             ]
             for dp_group_index in range(global_dp_size):
                 for pp_group_index in range(global_pp_size):
-                    tp_base_rank = (dp_group_index * global_pp_size +
-                                    pp_group_index) * global_tp_size
+                    dp_pp_serial_index = dp_group_index * global_pp_size + pp_group_index
+                    tp_base_rank = dp_pp_serial_index * global_tp_size
+                    odp_base_index = dp_pp_serial_index * flashcomm2_otp_size
+
                     for i in range(num_fc2_oproj_tensor_parallel_groups):
                         ranks = []
                         for j in range(flashcomm2_otp_size):
@@ -213,9 +215,8 @@ def init_ascend_model_parallel(parallel_config: ParallelConfig, ):
                             assert tp_local_rank < global_tp_size
                             global_rank = tp_base_rank + tp_local_rank
                             ranks.append(global_rank)
-                            odp_group_index = (
-                                dp_group_index * global_pp_size +
-                                pp_group_index) * flashcomm2_otp_size + j
+
+                            odp_group_index = odp_base_index + j
                             odp_group_ranks[odp_group_index].append(
                                 global_rank)
                         otp_group_ranks.append(ranks)
