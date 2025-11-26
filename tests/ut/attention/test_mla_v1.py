@@ -649,9 +649,10 @@ class TestAscendMLAMetadataBuilderBuild(TestBase):
             str(ctx.exception))
 
 
-class TestAscendMLAImpl(TestBase):
+class TestAscendMLAImpl:
 
-    def setUp(self):
+    @pytest.fixture(autouse=True)
+    def setup(self, mock_distributed):
         num_heads = 256
         head_size = 1024
         scale = 0.1
