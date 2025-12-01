@@ -848,10 +848,10 @@ class AscendMLAImpl(MLAAttentionImpl):
 
         if flashcomm2_o_shared_enabled():
             from vllm_ascend.distributed.parallel_state import \
-                get_flashcomm2_o_shared_group
+                get_shared_weight_group
             register_layer_to_shared_weight_series(
                 series_name="o_proj",
-                group=get_flashcomm2_o_shared_group(),
+                group=get_shared_weight_group(),
                 layer=self.o_proj,
                 prefetch_step=1)
 
