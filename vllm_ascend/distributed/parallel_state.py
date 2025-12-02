@@ -272,11 +272,8 @@ def init_ascend_model_parallel(parallel_config: ParallelConfig, ):
 
             # Create shared weight group for flashcomm2 oproj
             if flashcomm2_o_shared_enabled():
-                if global_dp_size == 1:
-                    _SHARED_WEIGHT = _FLASHCOMM2_ODP
-                else:
-                    _SHARED_WEIGHT = _create_shared_weight_group(
-                        flashcomm2_otp_size, "flashcomm2_o_shared")
+                _SHARED_WEIGHT = _create_shared_weight_group(
+                    flashcomm2_otp_size, "flashcomm2_o_shared")
 
 
 def get_mlp_tensor_model_parallel_world_size():
