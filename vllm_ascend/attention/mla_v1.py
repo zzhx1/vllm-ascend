@@ -35,7 +35,7 @@ from vllm_ascend.compilation.acl_graph import (get_graph_params,
                                                get_mtp_graph_params,
                                                update_graph_params_workspaces)
 from vllm_ascend.ops.shared_weight_layer import (
-    post_process_after_loading_for_shared_weight_series,
+    is_hidden_layer, post_process_after_loading_for_shared_weight_series,
     reach_layer_for_shared_weight_series,
     register_layer_to_shared_weight_series)
 from vllm_ascend.ops.weight_prefetch import maybe_npu_prefetch
@@ -845,8 +845,10 @@ class AscendMLAImpl(MLAAttentionImpl):
             'q_b_proj']
         self.kv_b_proj = kwargs['kv_b_proj']
         self.o_proj = kwargs['o_proj']
+        self.vllm_config = get_current_vllm_config()
+        self.fc2_enable = flashcomm2_o_shared_enabled()
 
-        if flashcomm2_o_shared_enabled():
+        if self.fc2_enable and is_hidden_layer(self.vllm_config, self.o_proj):
             from vllm_ascend.distributed.parallel_state import \
                 get_shared_weight_group
             register_layer_to_shared_weight_series(
@@ -866,11 +868,10 @@ class AscendMLAImpl(MLAAttentionImpl):
         self.enable_prefetch = ascend_config.weight_prefetch_config.enabled
         self.enable_kv_nz = ascend_config.torchair_graph_config.enable_kv_nz
 
-        vllm_config = get_current_vllm_config()
         self.ring_mla_mask_size = 512
         self.prefill_mask = None
 
-        self.speculative_config = vllm_config.speculative_config
+        self.speculative_config = self.vllm_config.speculative_config
         self.enable_mlapo = envs.VLLM_ASCEND_ENABLE_MLAPO
 
         self.pcp_size = get_pcp_group().world_size
@@ -1004,7 +1005,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         if self.enable_mlapo:
             self._process_weights_for_fused_mlapo(act_dtype)
 
-        if flashcomm2_o_shared_enabled():
+        if self.fc2_enable and is_hidden_layer(self.vllm_config, self.o_proj):
             post_process_after_loading_for_shared_weight_series(self.o_proj)
 
     def _process_weights_for_fused_mlapo(self, act_dtype: torch.dtype):
@@ -1545,7 +1546,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         kv_no_split = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(
             kv_no_split.contiguous(), need_gather_q_kv)
 
-        if flashcomm2_o_shared_enabled():
+        if self.fc2_enable and is_hidden_layer(self.vllm_config, self.o_proj):
             reach_layer_for_shared_weight_series(self.o_proj)
 
         decode_preprocess_res = None
@@ -1666,7 +1667,8 @@ class AscendMLAImpl(MLAAttentionImpl):
         assert output is not None, "Output tensor must be provided."
         if attn_metadata is None:
             # Profiling run.
-            if flashcomm2_o_shared_enabled():
+            if self.fc2_enable and is_hidden_layer(self.vllm_config,
+                                                   self.o_proj):
                 reach_layer_for_shared_weight_series(self.o_proj)
             return output.fill_(0)
         if self.pcp_size > 1:
