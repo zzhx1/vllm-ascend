@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar, Optional, Tuple, Type, TypeVar
-
+import math
 import torch
 import torch_npu
 from torch import nn
@@ -20,14 +20,14 @@ from vllm_ascend.attention.utils import (AscendCommonAttentionMetadata,
                                          wait_for_kv_layer_from_connector)
 from vllm_ascend.ops.weight_prefetch import maybe_npu_prefetch
 from vllm_ascend.utils import (ACL_FORMAT_FRACTAL_ND, ACL_FORMAT_FRACTAL_NZ,
-                               is_enable_nz)
+                               is_enable_nz, _round_up)
 from vllm_ascend.worker.npu_input_batch import InputBatch
-from vllm_ascend.utils import dispose_tensor, dispose_layer, replace_layer
-from vllm_ascend.distributed.sfa_sp_context import (set_sfa_sp_context, get_sfa_sp_context, check_diff)
+from vllm_ascend.utils import dispose_tensor, dispose_layer, replace_layer, enable_sp
 from vllm_ascend.ops.shared_weight_layer import (
     post_process_after_loading_for_shared_weight_series,
     reach_layer_for_shared_weight_series,
     register_layer_to_shared_weight_series)
+from vllm.forward_context import get_forward_context
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
@@ -59,6 +59,20 @@ class AscendSFABackend(AttentionBackend):
         return AscendSFAImpl
 
 
+
+@dataclass
+class SfaCpContext:
+    num_tokens: int
+    num_tokens_pad: int
+    local_start: int
+    local_end: int
+    local_end_with_pad: int
+    pad_size: int
+    local_pad_size: int
+    slot_mapping_cp: torch.Tensor
+    actual_seq_lengths_query: torch.Tensor
+    actual_seq_lengths_key: torch.Tensor
+
 @dataclass
 class AscendSFAMetadata:
     """Metadata for MLACommon.
@@ -89,6 +103,7 @@ class AscendSFAMetadata:
     attn_mask: torch.Tensor = None
     # chunked prefill by default if no attn_states passed
     attn_state: AscendAttentionState = AscendAttentionState.ChunkedPrefill
+    sfa_cp_context: Optional[SfaCpContext] = None
 
 
 M = TypeVar("M", bound=AscendSFAMetadata)
@@ -131,6 +146,9 @@ class AscendSFAMetadataBuilder:
         self.rope_dim = self.model_config.hf_text_config.qk_rope_head_dim
         self.cos_cache = None
         self.sin_cache = None
+
+        self.enable_sfa_cp = enable_sp() and \
+            hasattr(self.model_config.hf_config, "index_topk")
 
     def reorder_batch(self, input_batch: "InputBatch",
                       scheduler_output: "SchedulerOutput") -> bool:
@@ -180,6 +198,63 @@ class AscendSFAMetadataBuilder:
             1).unsqueeze(2)
         sin = self.sin_cache[input_positions].unsqueeze(  # type: ignore
             1).unsqueeze(2)
+        
+        sfa_sp_context = None
+        if self.enable_sfa_cp:
+            global_tp_size = get_tp_group().world_size
+            num_tokens = num_actual_tokens
+            num_tokens_pad = _round_up(num_actual_tokens, global_tp_size)
+            num_tokens_per_device = num_tokens_pad // global_tp_size
+            pad_size = num_tokens_pad - num_tokens
+            local_start = get_tp_group().rank_in_group * num_tokens_per_device
+            local_end_with_pad = local_start + num_tokens_per_device
+            local_end = min(local_end_with_pad, num_actual_tokens)
+            local_pad_size = local_end_with_pad - local_end
+
+            if pad_size > 0:
+                cos = nn.functional.pad(cos, (0, 0, 0, 0, 0, 0, 0, pad_size))
+                sin = nn.functional.pad(sin, (0, 0, 0, 0, 0, 0, 0, pad_size))
+                slot_mapping = nn.functional.pad(slot_mapping, (0, pad_size), value=-1)
+            cos = cos[local_start:local_end_with_pad]
+            sin = sin[local_start:local_end_with_pad]
+            slot_mapping_cp = slot_mapping[local_start:local_end_with_pad]
+
+            actual_seq_lengths_query = torch.empty_like(cum_query_lens) 
+            actual_seq_lengths_key = torch.empty_like(seq_lens)
+            num_segs = cum_query_lens.shape[0]
+            last_token = 0
+            cum = 0
+            for i in range(0, num_segs):
+                global_start = last_token
+                global_end = cum_query_lens[i].item()
+                last_token = global_end
+
+                local_start = max(global_start, local_start)
+                local_end = min(global_end, local_end_with_pad)
+                num_local_tokens = local_end - local_start
+
+                if num_local_tokens > 0:
+                    cum += num_local_tokens
+                    actual_seq_lengths_query[i] = cum
+
+                    offset = global_end - local_end
+                    actual_seq_lengths_key[i] = seq_lens[i].item() - offset
+                else:
+                    actual_seq_lengths_query[i] = cum
+                    actual_seq_lengths_key[i] = 0
+
+            sfa_sp_context = SfaCpContext(
+                num_tokens=num_tokens,
+                num_tokens_pad=num_tokens_pad,
+                local_start=local_start,
+                local_end=local_end,
+                local_end_with_pad=local_end_with_pad,
+                pad_size=pad_size,
+                local_pad_size=local_pad_size,
+                slot_mapping_cp=slot_mapping_cp,
+                actual_seq_lengths_query=actual_seq_lengths_query,
+                actual_seq_lengths_key=actual_seq_lengths_key,
+            )
 
         return self.metadata_cls(  # type: ignore
             has_prefill=has_prefill,
@@ -193,7 +268,8 @@ class AscendSFAMetadataBuilder:
             attn_state=common_attn_metadata.attn_state,
             block_tables=block_table,
             sin=sin,
-            cos=cos)
+            cos=cos,
+            sfa_cp_context=sfa_sp_context)
 
     def build_for_graph_capture(
         self,
@@ -269,52 +345,16 @@ class AscendSFAImpl(MLAAttentionImpl):
         self.enable_shared_expert_dp = ascend_config.enable_shared_expert_dp
         self.enable_prefetch = ascend_config.weight_prefetch_config.enabled
         self.enable_kv_nz = ascend_config.torchair_graph_config.enable_kv_nz
-
+        self.model_config = get_current_vllm_config().model_config
         assert self.indexer is not None, "Indexer is required for DSA."
         
-        self.enable_sfa_cp = ascend_config.enable_sfa_cp
+        self.enable_sfa_cp = enable_sp() and \
+            hasattr(self.model_config.hf_config, "index_topk")
         self.local_num_heads = self.num_heads
         if self.enable_sfa_cp:
             self.local_num_heads = self.num_heads * self.tp_size
-            vllm_config = get_current_vllm_config()
-
-            # Dispose tensor from the original q_proj
-            dispose_layer(self.q_proj)
-            # Construct the new q_proj using ReplicatedLinear
-            new_q_proj = ReplicatedLinear(
-                self.q_lora_rank,
-                self.local_num_heads * self.qk_head_dim,
-                bias=False,
-                quant_config=vllm_config.quant_config,
-                prefix=self.q_proj.prefix)
-            # Replace the q_proj with the new one
-            replace_layer(self.q_proj, new_q_proj)
-
-            # Dispose tensor from the original kv_b_proj
-            dispose_layer(self.kv_b_proj)
-            # Construct the new kv_b_proj using ReplicatedLinear
-            new_kv_b_proj = ReplicatedLinear(
-                self.kv_lora_rank,
-                self.local_num_heads * (self.qk_nope_head_dim + self.v_head_dim),
-                bias=False,
-                quant_config=vllm_config.quant_config,
-                prefix=self.kv_b_proj.prefix)
-            # Replace the kv_b_proj with the new one
-            replace_layer(self.kv_b_proj, new_kv_b_proj)
-
-            # Dispose tensor from the original o_proj
-            dispose_layer(self.o_proj)
-            # Construct the new o_proj using ReplicatedLinear
-            config = vllm_config.model_config.hf_config
-            new_o_proj = ReplicatedLinear(
-                config.num_attention_heads * config.v_head_dim,
-                config.hidden_size,
-                bias=False,
-                quant_config=vllm_config.quant_config,
-                prefix=self.o_proj.prefix)
-            # Replace the o_proj with the new one
-            replace_layer(self.o_proj, new_o_proj)
-
+            #TODO: Temporarily adapt sfa-cp, remove after adapting near PCP. --clrs97
+            self._replace_linear_class_for_sfa_cp()
             from vllm_ascend.distributed.parallel_state import get_shared_weight_group
             register_layer_to_shared_weight_series(
                 series_name="q_proj",
@@ -470,6 +510,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 cache_mode=cache_mode,
                 is_output_kv=True,
             )
+            #TODO: Temporarily adapt SFA-CP and replace it later with PCP. --clrs97
             k_pe = get_tp_group().all_gather(k_pe, 0)
             k_nope = get_tp_group().all_gather(k_nope, 0)
 
@@ -527,11 +568,8 @@ class AscendSFAImpl(MLAAttentionImpl):
         num_actual_tokens = attn_metadata.num_actual_tokens
         hidden_states = hidden_states[:num_actual_tokens]
 
-        sfa_sp_context = None
         if self.enable_sfa_cp:
             need_gather_q_kv = False
-            set_sfa_sp_context(hidden_states, attn_metadata.num_actual_tokens)
-            sfa_sp_context = get_sfa_sp_context()
 
         # Inputs and outputs may be padded for CUDA graphs
         output_padded = output
@@ -562,13 +600,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         slot_mapping = attn_metadata.slot_mapping[:num_actual_tokens]
         slot_mapping_cp = None
         if self.enable_sfa_cp:
-            if sfa_sp_context.pad_size > 0:
-                cos = nn.functional.pad(cos, (0, 0, 0, 0, 0, 0, 0, sfa_sp_context.pad_size))
-                sin = nn.functional.pad(sin, (0, 0, 0, 0, 0, 0, 0, sfa_sp_context.pad_size))
-                slot_mapping = nn.functional.pad(slot_mapping, (0, sfa_sp_context.pad_size), value=-1)
-            cos = cos[sfa_sp_context.local_start:sfa_sp_context.local_end_with_pad]
-            sin = sin[sfa_sp_context.local_start:sfa_sp_context.local_end_with_pad]
-            slot_mapping_cp = slot_mapping[sfa_sp_context.local_start:sfa_sp_context.local_end_with_pad]
+            slot_mapping_cp = attn_metadata.sfa_cp_context.slot_mapping_cp
 
         self.exec_kv(kv_no_split, cos, sin, kv_cache, slot_mapping, slot_mapping_cp)
         self.indexer_k(x=hidden_states,
@@ -584,34 +616,12 @@ class AscendSFAImpl(MLAAttentionImpl):
         ql_nope, q_pe = self._q_proj_and_k_up_proj(q_c)
         q_pe = self.rope_single(q_pe, cos, sin)
         
-        cum_query_lens = attn_metadata.cum_query_lens
-        seq_lens = attn_metadata.seq_lens
-        actual_seq_lengths_query = cum_query_lens
-        actual_seq_lengths_key = seq_lens
+        actual_seq_lengths_query = attn_metadata.cum_query_lens
+        actual_seq_lengths_key = attn_metadata.seq_lens
+
         if self.enable_sfa_cp:
-            actual_seq_lengths_query = torch.empty_like(cum_query_lens) 
-            actual_seq_lengths_key = torch.empty_like(seq_lens)
-            num_segs = cum_query_lens.shape[0]
-            last_token = 0
-            cum = 0
-            for i in range(0, num_segs):
-                global_start = last_token
-                global_end = cum_query_lens[i].item()
-                last_token = global_end
-
-                local_start = max(global_start, sfa_sp_context.local_start)
-                local_end = min(global_end, sfa_sp_context.local_end_with_pad)
-                num_local_tokens = local_end - local_start
-
-                if num_local_tokens > 0:
-                    cum += num_local_tokens
-                    actual_seq_lengths_query[i] = cum
-
-                    offset = global_end - local_end
-                    actual_seq_lengths_key[i] = seq_lens[i].item() - offset
-                else:
-                    actual_seq_lengths_query[i] = cum
-                    actual_seq_lengths_key[i] = 0
+            actual_seq_lengths_query = attn_metadata.sfa_cp_context.actual_seq_lengths_query
+            actual_seq_lengths_key = attn_metadata.sfa_cp_context.actual_seq_lengths_key
         
         topk_indices = self.indexer_select(x=hidden_states,
                                            qr=q_c,
@@ -672,6 +682,7 @@ class AscendSFAImpl(MLAAttentionImpl):
 
         k = torch.cat([k_pe, k_nope], dim=-1)  # [b*s,128]
         if self.enable_sfa_cp:
+            # TODO: Temporarily adapt SFA-CP and replace it later with PCP. --clrs97
             k = get_tp_group().all_gather(k, 0)
         if kv_cache is not None:
             torch_npu.npu_scatter_nd_update_(kv_cache[2].view(-1, k.shape[-1]),
@@ -724,3 +735,45 @@ class AscendSFAImpl(MLAAttentionImpl):
             sparse_count=2048,
             sparse_mode=3)
         return topk_indices
+    
+    def _replace_linear_class_for_sfa_cp(self):
+
+        vllm_config = get_current_vllm_config()
+        # Dispose tensor from the original q_proj
+        dispose_layer(self.q_proj)
+        # Construct the new q_proj using ReplicatedLinear
+        new_q_proj = ReplicatedLinear(
+            self.q_lora_rank,
+            self.local_num_heads * self.qk_head_dim,
+            bias=False,
+            quant_config=vllm_config.quant_config,
+            prefix=self.q_proj.prefix)
+        # Replace the q_proj with the new one
+        replace_layer(self.q_proj, new_q_proj)
+
+        # Dispose tensor from the original kv_b_proj
+        dispose_layer(self.kv_b_proj)
+        # Construct the new kv_b_proj using ReplicatedLinear
+        new_kv_b_proj = ReplicatedLinear(
+            self.kv_lora_rank,
+            self.local_num_heads * (self.qk_nope_head_dim + self.v_head_dim),
+            bias=False,
+            quant_config=vllm_config.quant_config,
+            prefix=self.kv_b_proj.prefix)
+        # Replace the kv_b_proj with the new one
+        replace_layer(self.kv_b_proj, new_kv_b_proj)
+
+        # Dispose tensor from the original o_proj
+        dispose_layer(self.o_proj)
+        # Construct the new o_proj using ReplicatedLinear
+        config = vllm_config.model_config.hf_config
+        new_o_proj = ReplicatedLinear(
+            config.num_attention_heads * config.v_head_dim,
+            config.hidden_size,
+            bias=False,
+            quant_config=vllm_config.quant_config,
+            prefix=self.o_proj.prefix)
+        # Replace the o_proj with the new one
+        replace_layer(self.o_proj, new_o_proj)
+        
+

@@ -9,7 +9,7 @@ from vllm.distributed.parallel_state import (GroupCoordinator, get_dp_group,
 import vllm_ascend.envs as envs_ascend
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.utils import (flashcomm2_enable,
-                               prefill_context_parallel_enable)
+                               prefill_context_parallel_enable, enable_sp)
 
 # Currently, mc2 op need their own group coordinator.
 _MC2: Optional[GroupCoordinator] = None
@@ -227,16 +227,18 @@ def init_ascend_model_parallel(parallel_config: ParallelConfig, ):
                 get_world_group().local_rank,
                 backend,
                 group_name="flashcomm2_odp")
-
-    # If SFA CP is enabled, we will create one world group for shared weights.
-    if get_ascend_config().enable_sfa_cp:
+            
+    vllm_config = get_current_vllm_config()
+    # TODO: Check if the model is Deepseek V3.2 with enabled SFA CP and activated shared weights. It will then be normalized within the PCP parameters. -- clrs97
+    is_ds_v32 = hasattr(vllm_config.model_config.hf_config, "index_topk")
+    if enable_sp() and is_ds_v32:
         global _SHARED_WEIGHT
         group_ranks = [list(range(torch.distributed.get_world_size()))]
         _SHARED_WEIGHT = init_model_parallel_group(
             group_ranks,
             get_world_group().local_rank,
             backend,
-            group_name="flashcomm2_o_shared")
+            group_name="CP_shared_weight")
 
 def get_mlp_tensor_model_parallel_world_size():
     """Return world size for the tensor model parallel group."""
