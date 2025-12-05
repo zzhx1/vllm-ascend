@@ -838,12 +838,7 @@ class TestAscendMLAImpl(TestBase):
         model_config.dtype = torch.float16
         vllm_config.model_config = model_config
         get_current_vllm_config.return_value = vllm_config
-        vllm_config.additional_config = {
-            "torchair_graph_config": {
-                "enabled": False,
-            },
-            "refresh": True
-        }
+        vllm_config.additional_config = {"refresh": True}
         init_ascend_config(vllm_config)
 
         num_heads = 256
