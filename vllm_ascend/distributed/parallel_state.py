@@ -264,6 +264,13 @@ def get_flashcomm2_odp_group() -> GroupCoordinator:
     return _FLASHCOMM2_ODP
 
 
+def get_shared_weight_group() -> GroupCoordinator:
+    assert _SHARED_WEIGHT is not None, (
+        "output shared weight parallel group for flashcomm2 is not initialized"
+    )
+    return _SHARED_WEIGHT
+
+
 def get_p_tp_group() -> GroupCoordinator:
     assert _P_TP is not None, (
         "distributed prefill tensor parallel group is not initialized")
@@ -295,11 +302,6 @@ def destroy_ascend_model_parallel():
     if _OTP:
         _OTP.destroy()
     _OTP = None
-
-    global _EMBED_TP
-    if _EMBED_TP:
-        _EMBED_TP.destroy()
-    _EMBED_TP = None
 
     global _P_TP
     if _P_TP:
