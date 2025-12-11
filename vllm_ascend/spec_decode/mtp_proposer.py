@@ -8,6 +8,7 @@ import torch.nn.functional as F
 from vllm.config import (CUDAGraphMode, VllmConfig,
                          get_layers_from_vllm_config, set_current_vllm_config)
 from vllm.distributed import get_pcp_group
+from vllm.distributed.parallel_state import get_pp_group
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -206,7 +207,8 @@ class MtpProposer(Proposer):
             # check if mtp model use main model's embedding and LMhead
             main_model = model
             if torch.equal(self.model.model.embed_tokens.weight,
-                           main_model.model.embed_tokens.weight):
+                           main_model.model.embed_tokens.weight
+                           ) and get_pp_group().world_size == 1:
                 self.model.model.embed_tokens = main_model.model.embed_tokens
             for _, layer_module in self.model.model.layers.items():
                 if torch.equal(layer_module.shared_head.head.weight,
