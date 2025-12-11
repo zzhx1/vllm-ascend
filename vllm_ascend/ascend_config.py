@@ -67,8 +67,10 @@ class AscendConfig:
         self.ascend_compilation_config = AscendCompilationConfig(
             **ascend_compilation_config)
 
-        module_tp_config = additional_config.get("module_tp_config", {})
-        self.module_tp_config = ModuleTPConfig(module_tp_config, vllm_config)
+        finegrained_tp_config = additional_config.get("finegrained_tp_config",
+                                                      {})
+        self.finegrained_tp_config = FinegrainedTPConfig(
+            finegrained_tp_config, vllm_config)
 
         # Dump / PrecisionDebugger configuration
         dump_config_path = additional_config.get("dump_config", None)
@@ -156,19 +158,19 @@ class AscendConfig:
             kv_cfg._engine_id_patched = True
 
 
-class ModuleTPConfig:
+class FinegrainedTPConfig:
     """
-    Configuration Object for module_tp_config from additional_config
+    Configuration Object for finegrained_tp_config from additional_config
     """
 
-    def __init__(self, module_tp_config: dict, vllm_config):
-        self.oproj_tensor_parallel_size = module_tp_config.get(
+    def __init__(self, finegrained_tp_config: dict, vllm_config):
+        self.oproj_tensor_parallel_size = finegrained_tp_config.get(
             "oproj_tensor_parallel_size", 0)
-        self.lmhead_tensor_parallel_size = module_tp_config.get(
+        self.lmhead_tensor_parallel_size = finegrained_tp_config.get(
             "lmhead_tensor_parallel_size", 0)
-        self.embedding_tensor_parallel_size = module_tp_config.get(
+        self.embedding_tensor_parallel_size = finegrained_tp_config.get(
             "embedding_tensor_parallel_size", 0)
-        self.mlp_tensor_parallel_size = module_tp_config.get(
+        self.mlp_tensor_parallel_size = finegrained_tp_config.get(
             "mlp_tensor_parallel_size", 0)
 
         enabled_configs = []
@@ -208,7 +210,7 @@ class ModuleTPConfig:
                     "module tp sizes must divide data_parallel_size")
         if any(size > 0 for size in module_tp_sizes) and enabled_configs:
             logger.info(
-                f"module_tp_config enabled: {', '.join(enabled_configs)}")
+                f"finegrained_tp_config enabled: {', '.join(enabled_configs)}")
 
 
 class AscendCompilationConfig:

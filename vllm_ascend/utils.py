@@ -705,20 +705,23 @@ def get_ascend_device_type():
 
 
 def lmhead_tp_enable() -> bool:
-    return get_ascend_config().module_tp_config.lmhead_tensor_parallel_size > 0
+    return get_ascend_config(
+    ).finegrained_tp_config.lmhead_tensor_parallel_size > 0
 
 
 def embedding_tp_enable() -> bool:
     return get_ascend_config(
-    ).module_tp_config.embedding_tensor_parallel_size > 0
+    ).finegrained_tp_config.embedding_tensor_parallel_size > 0
 
 
 def oproj_tp_enable() -> bool:
-    return get_ascend_config().module_tp_config.oproj_tensor_parallel_size > 0
+    return get_ascend_config(
+    ).finegrained_tp_config.oproj_tensor_parallel_size > 0
 
 
 def mlp_tp_enable() -> bool:
-    return get_ascend_config().module_tp_config.mlp_tensor_parallel_size > 0
+    return get_ascend_config(
+    ).finegrained_tp_config.mlp_tensor_parallel_size > 0
 
 
 def matmul_allreduce_enable() -> bool:
@@ -966,7 +969,7 @@ def get_flashcomm2_config_and_validate(ascend_config, vllm_config):
         logger.warning_once(
             "It is recommended to enable FLASHCOMM1 simultaneously when starting FLASHCOMM2 for optimal performance."
         )
-    if ascend_config.module_tp_config.oproj_tensor_parallel_size > 0:
+    if ascend_config.finegrained_tp_config.oproj_tensor_parallel_size > 0:
         raise AssertionError(
             "flashcomm2_oproj_tensor_parallel_size cannot be enabled simultaneously with oproj_tensor_parallel_size"
         )

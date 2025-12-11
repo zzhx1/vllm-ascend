@@ -44,8 +44,8 @@ class TestCustomVocabParallelEmbedding(unittest.TestCase):
         mock_vllm_config = MagicMock()
         mock_vllm_config.additional_config = {}
         self.mock_ascend_config = MagicMock()
-        self.mock_ascend_config.module_tp_config.lmhead_tensor_parallel_size = 2
-        self.mock_ascend_config.module_tp_config.embedding_tensor_parallel_size = 2
+        self.mock_ascend_config.finegrained_tp_config.lmhead_tensor_parallel_size = 2
+        self.mock_ascend_config.finegrained_tp_config.embedding_tensor_parallel_size = 2
 
         self.patches = [
             patch("vllm_ascend.utils.get_ascend_config",

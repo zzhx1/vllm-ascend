@@ -25,8 +25,8 @@ class BaseLinearTest(unittest.TestCase):
         parallel_state._OTP = self.mock_group
 
         self.mock_ascend_config = MagicMock()
-        self.mock_ascend_config.module_tp_config.oproj_tensor_parallel_size = 2
-        self.mock_ascend_config.module_tp_config.mlp_tensor_parallel_size = 2
+        self.mock_ascend_config.finegrained_tp_config.oproj_tensor_parallel_size = 2
+        self.mock_ascend_config.finegrained_tp_config.mlp_tensor_parallel_size = 2
 
         self.patches = [
             patch("vllm_ascend.ascend_config.get_ascend_config",
@@ -84,7 +84,7 @@ class TestAscendRowParallelLinear(BaseLinearTest):
 
         ascend_config._ASCEND_CONFIG = MagicMock()
         ascend_config._ASCEND_CONFIG.recompute_scheduler_enable = False
-        ascend_config._ASCEND_CONFIG.module_tp_config.mlp_tensor_parallel_size = 2
+        ascend_config._ASCEND_CONFIG.finegrained_tp_config.mlp_tensor_parallel_size = 2
         ascend_config._ASCEND_CONFIG.ascend_scheduler_config.enabled = False
 
         linear = AscendRowParallelLinear(
@@ -103,7 +103,7 @@ class TestAscendRowParallelLinear(BaseLinearTest):
 
         ascend_config._ASCEND_CONFIG = MagicMock()
         ascend_config._ASCEND_CONFIG.recompute_scheduler_enable = False
-        ascend_config._ASCEND_CONFIG.module_tp_config.oproj_tensor_parallel_size = 2
+        ascend_config._ASCEND_CONFIG.finegrained_tp_config.oproj_tensor_parallel_size = 2
         ascend_config._ASCEND_CONFIG.ascend_scheduler_config.enabled = False
 
         linear = AscendRowParallelLinear(
@@ -123,7 +123,7 @@ class TestAscendMergedColumnParallelLinear(BaseLinearTest):
 
         ascend_config._ASCEND_CONFIG = MagicMock()
         ascend_config._ASCEND_CONFIG.recompute_scheduler_enable = False
-        ascend_config._ASCEND_CONFIG.module_tp_config.mlp_tensor_parallel_size = 2
+        ascend_config._ASCEND_CONFIG.finegrained_tp_config.mlp_tensor_parallel_size = 2
         ascend_config._ASCEND_CONFIG.ascend_scheduler_config.enabled = False
 
         linear = AscendMergedColumnParallelLinear(

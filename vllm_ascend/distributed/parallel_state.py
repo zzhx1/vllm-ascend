@@ -141,13 +141,14 @@ def init_ascend_model_parallel(parallel_config: ParallelConfig, ):
 
         return _group_cache[group_size]
 
-    otp_size = get_ascend_config().module_tp_config.oproj_tensor_parallel_size
+    otp_size = get_ascend_config(
+    ).finegrained_tp_config.oproj_tensor_parallel_size
     lmhead_tp_size = get_ascend_config(
-    ).module_tp_config.lmhead_tensor_parallel_size
+    ).finegrained_tp_config.lmhead_tensor_parallel_size
     embedding_tp_size = get_ascend_config(
-    ).module_tp_config.embedding_tensor_parallel_size
+    ).finegrained_tp_config.embedding_tensor_parallel_size
     mlp_tp_size = get_ascend_config(
-    ).module_tp_config.embedding_tensor_parallel_size
+    ).finegrained_tp_config.embedding_tensor_parallel_size
 
     global _OTP, _LMTP, _EMBED_TP
 
