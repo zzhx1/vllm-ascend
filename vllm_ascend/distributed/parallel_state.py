@@ -79,6 +79,9 @@ def init_ascend_model_parallel(parallel_config: ParallelConfig, ):
     world_size = torch.distributed.get_world_size()
     backend = torch.distributed.get_backend(get_world_group().device_group)
     vllm_config = get_current_vllm_config()
+    global_tp_size = get_tp_group().world_size
+    global_dp_size = get_dp_group().world_size
+    global_pp_size = get_pp_group().world_size
 
     # The layout of all ranks: ExternalDP * EP
     # ExternalDP is the data parallel group that is not part of the model,
@@ -204,16 +207,13 @@ def init_ascend_model_parallel(parallel_config: ParallelConfig, ):
     global _SHARED_WEIGHT
     # TODO: Check if the model is Deepseek V3.2 with enabled SFA CP and activated shared weights. It will then be normalized within the PCP parameters. -- clrs97
     is_ds_v32 = hasattr(vllm_config.model_config.hf_config, "index_topk")
-    if enable_sp() and is_ds_v32:
+    if enable_sp() and is_ds_v32 and _SHARED_WEIGHT is None:
         _SHARED_WEIGHT = _create_shared_weight_group("CP_shared_weight")
 
     # TODO: Extract and unify the logic across different communication group.
     if flashcomm2_enable():
         flashcomm2_otp_size = get_ascend_config(
         ).flashcomm2_oproj_tensor_parallel_size
-        global_tp_size = get_tp_group().world_size
-        global_dp_size = get_dp_group().world_size
-        global_pp_size = get_pp_group().world_size
         num_fc2_oproj_tensor_parallel_groups: int = (global_tp_size //
                                                      flashcomm2_otp_size)
 
@@ -262,7 +262,9 @@ def init_ascend_model_parallel(parallel_config: ParallelConfig, ):
         # Create shared weight group for flashcomm2 oproj
         if flashcomm2_o_shared_enabled():
             assert flashcomm2_otp_size == 1, "flashcomm2_o_shared is only supported when flashcomm2_otp_size is 1"
-            _SHARED_WEIGHT = _create_shared_weight_group("flashcomm2_o_shared")
+            if _SHARED_WEIGHT is None:
+                _SHARED_WEIGHT = _create_shared_weight_group(
+                    "flashcomm2_o_shared")
 
 
 def get_mlp_tensor_model_parallel_world_size():
