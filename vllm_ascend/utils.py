@@ -979,7 +979,7 @@ def get_flashcomm2_config_and_validate(ascend_config, vllm_config):
         logger.warning_once(
             "It is recommended to enable FLASHCOMM1 simultaneously when starting FLASHCOMM2 for optimal performance."
         )
-    if ascend_config.module_tp_config.oproj_tensor_parallel_size is not None:
+    if ascend_config.module_tp_config.oproj_tensor_parallel_size > 0:
         raise AssertionError(
             "flashcomm2_oproj_tensor_parallel_size cannot be enabled simultaneously with oproj_tensor_parallel_size"
         )
