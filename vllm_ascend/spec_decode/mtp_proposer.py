@@ -206,10 +206,11 @@ class MtpProposer(Proposer):
         if self.vllm_config.model_config.is_deepseek_mla:
             # check if mtp model use main model's embedding and LMhead
             main_model = model
-            if torch.equal(self.model.model.embed_tokens.weight,
-                           main_model.model.embed_tokens.weight
-                           ) and get_pp_group().world_size == 1:
-                self.model.model.embed_tokens = main_model.model.embed_tokens
+            if get_pp_group().world_size == 1:
+                # If pp>1, the weights of mtp and the main model's embedding are not on the same device.
+                if torch.equal(self.model.model.embed_tokens.weight,
+                               main_model.model.embed_tokens.weight):
+                    self.model.model.embed_tokens = main_model.model.embed_tokens
             for _, layer_module in self.model.model.layers.items():
                 if torch.equal(layer_module.shared_head.head.weight,
                                main_model.lm_head.weight):
