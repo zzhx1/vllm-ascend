@@ -607,7 +607,7 @@ def _get_column_parallel_op(
         prefix, layer
 ) -> Optional[Union[MLPColumnParallelOp, SequenceColumnParallelOp]]:
     if "gate_up_proj" in prefix and mlp_tp_enable(
-    ) and not maybe_is_moe_layer(prefix):
+    ) and not is_moe_layer(prefix):
         return MLPColumnParallelOp(layer)
     if enable_sp():
         if "shared_expert" in prefix:
@@ -631,8 +631,7 @@ def _get_row_parallel_op(
 ) -> Optional[Union[MLPRowParallelOp, OProjRowParallelOp,
                     Flashcomm2OProjRowParallelOp, MatmulAllreduceRowParallelOp,
                     SequenceRowParallelOp]]:
-    if "down_proj" in prefix and mlp_tp_enable(
-    ) and not maybe_is_moe_layer(prefix):
+    if "down_proj" in prefix and mlp_tp_enable() and not is_moe_layer(prefix):
         return MLPRowParallelOp(layer)
     if "o_proj" in prefix and oproj_tp_enable():
         return OProjRowParallelOp(layer)
@@ -686,7 +685,7 @@ def get_replicated_op(disable_tp, prefix,
     return CustomReplicatedOp(layer)
 
 
-def maybe_is_moe_layer(prefix: str) -> bool:
+def is_moe_layer(prefix: str) -> bool:
     from vllm.config import get_current_vllm_config
     match = re.search(r'layers\.(\d+)\.', prefix)
     layer_idx = int(match.group(1))
