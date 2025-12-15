@@ -36,7 +36,7 @@ How to extend a new linear op? Taking column parallel op as an example:
 Row parallel op follows a similar approach - inherit from RowColumnParallelOp and register the new class in get_row_parallel_op.
 """
 
-from typing import Optional, Union
+from typing import Optional, Union, SimpleNamespace
 
 import torch
 import torch.distributed as dist
@@ -60,7 +60,7 @@ from vllm_ascend.utils import (dense_optim_enable, enable_sp,
                                flashcomm2_enable,
                                get_flashcomm2_reorgnized_batch_ids,
                                matmul_allreduce_enable, mlp_tp_enable,
-                               oproj_tp_enable, shared_expert_dp_enabled)
+                               oproj_tp_enable, shared_expert_dp_enabled, enable_dsa_cp)
 
 
 class CustomLinearOp:
@@ -602,9 +602,37 @@ class SequenceRowParallelOp(CustomRowParallelOp):
         self.reduce_results = self.layer.reduce_results
 
 
+class ShardedCPRowParallelOp(CustomRowParallelOp):
+    # Initialize `RowParallelLinear` as a replicated linear layer.
+    def __init__(self, layer):
+        super().__init__(layer)
+        self.reduce_results = False
+    @property
+    def comm_group(self):
+        # fake comm group to bypass tp logic
+        return SimpleNamespace(
+            world_size=1,
+            rank_in_group=0,
+            device_group=None
+        )
+    
+class ShardedCPColumnParallelOp(CustomColumnParallelOp):   
+    @property
+    def comm_group(self):
+        # fake comm group to bypass tp logic
+        return SimpleNamespace(
+            world_size=1,
+            rank_in_group=0,
+            device_group=None
+        )
+
+
+
 def _get_column_parallel_op(
         prefix, layer
-) -> Optional[Union[MLPColumnParallelOp, SequenceColumnParallelOp]]:
+) -> Optional[Union[MLPColumnParallelOp, SequenceColumnParallelOp, ShardedCPColumnParallelOp]]:
+    if enable_dsa_cp() and "q_b_proj" in prefix and "kv_b_proj" in prefix:
+        return ShardedCPColumnParallelOp(layer)
     if mlp_tp_enable() and "gate_up_proj" in prefix:
         return MLPColumnParallelOp(layer)
     if enable_sp():
@@ -628,7 +656,9 @@ def _get_row_parallel_op(
     prefix, layer
 ) -> Optional[Union[MLPRowParallelOp, OProjRowParallelOp,
                     Flashcomm2OProjRowParallelOp, MatmulAllreduceRowParallelOp,
-                    SequenceRowParallelOp]]:
+                    SequenceRowParallelOp, ShardedCPRowParallelOp]]:
+    if enable_dsa_cp() and "o_proj" in prefix:
+        return ShardedCPRowParallelOp(layer)
     if "down_proj" in prefix and mlp_tp_enable():
         return MLPRowParallelOp(layer)
     if "o_proj" in prefix and oproj_tp_enable():
@@ -681,3 +711,8 @@ def get_replicated_op(disable_tp, prefix,
         return None
 
     return CustomReplicatedOp(layer)
+
+
+
+
+
