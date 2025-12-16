@@ -31,7 +31,7 @@ from vllm_ascend.ops.weight_prefetch import maybe_npu_prefetch
 from vllm_ascend.quantization.w8a8 import AscendW8A8LinearMethod
 from vllm_ascend.utils import (ACL_FORMAT_FRACTAL_ND, ACL_FORMAT_FRACTAL_NZ,
                                _round_up, dispose_layer, enable_sp,
-                               is_enable_nz, replace_layer)
+                               is_enable_nz, replace_layer, enable_dsa_cp)
 from vllm_ascend.worker.npu_input_batch import InputBatch
 
 if TYPE_CHECKING:
@@ -146,9 +146,7 @@ class AscendSFAMetadataBuilder:
         self.cos_cache = None
         self.sin_cache = None
 
-        self.enable_sfa_cp = enable_sp() and \
-            hasattr(self.model_config.hf_config, "index_topk")
-
+        self.enable_sfa_cp = enable_dsa_cp()
     def reorder_batch(self, input_batch: "InputBatch",
                       scheduler_output: "SchedulerOutput") -> bool:
         # No need to reorder for Ascend SFA
@@ -370,14 +368,14 @@ class AscendSFAImpl(MLAAttentionImpl):
 
         assert self.indexer is not None, "Indexer is required for DSA."
 
-        self.enable_sfa_cp = enable_sp()
+        self.enable_sfa_cp = enable_dsa_cp()
         self.local_num_heads = self.num_heads
         self.vllm_config = get_current_vllm_config()
         if self.enable_sfa_cp:
             self.local_num_heads = self.num_heads * self.tp_size
 
             #TODO: Temporarily adapt sfa-cp, remove after adapting near PCP. --clrs97
-            self._replace_linear_class_for_sfa_cp()
+            # self._replace_linear_class_for_sfa_cp()
             from vllm_ascend.distributed.parallel_state import \
                 get_shared_weight_group
             if is_hidden_layer(self.vllm_config, self.q_proj):

@@ -1065,6 +1065,8 @@ def replace_layer(original_layer: Any, new_layer: Any):
     original_layer.__dict__ = new_layer.__dict__
 
 
+# TODO: Check if the model is Deepseek V3.2 with enabled SFA CP and activated shared weights. It will then be normalized within the PCP parameters. -- clrs97
+@functools.cache
 def enable_dsa_cp() -> bool:
     from vllm.config import get_current_vllm_config
     vllm_config = get_current_vllm_config()
