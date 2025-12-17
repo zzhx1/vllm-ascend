@@ -211,7 +211,8 @@ class MtpProposer(Proposer):
                 if torch.equal(layer_module.shared_head.head.weight,
                                main_model.lm_head.weight):
                     layer_module.shared_head.head = main_model.lm_head
-
+        if torch.distributed.get_rank() == 0:
+            print(f"self.draft_model: {self.model}")
         if self.vllm_config.compilation_config.cudagraph_mode.has_full_cudagraphs(
         ):
             self.update_stream: torch.npu.Stream = torch.npu.Stream()

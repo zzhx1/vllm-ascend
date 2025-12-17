@@ -813,6 +813,10 @@ def is_vl_model(vllm_config: VllmConfig):
         _IS_VL_MODEL = "VL" in model_configs["architectures"][0]
     return _IS_VL_MODEL
 
+def weak_ref_tensor_op(tensor: torch.Tensor) -> torch.Tensor:
+    if not tensor.device.type == 'npu':
+        raise RuntimeError("Tensor must be on NPU device")
+    return tensor.as_strided(tensor.size(), tensor.stride(), tensor.storage_offset())
 
 def weak_ref_tensor(tensor: Any) -> Any:
     """
@@ -821,7 +825,8 @@ def weak_ref_tensor(tensor: Any) -> Any:
     but will not keep the original tensor alive.
     """
     if isinstance(tensor, torch.Tensor):
-        return torch.ops._C_ascend.weak_ref_tensor(tensor)
+        # return torch.ops._C_ascend.weak_ref_tensor(tensor)
+        return weak_ref_tensor_op(tensor) 
     else:
         return tensor
 

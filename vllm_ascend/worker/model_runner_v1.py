@@ -1439,7 +1439,7 @@ class NPUModelRunner(GPUModelRunner):
             fused_all2all_enable = quant_type == "w8a8_dynamic" and get_ep_group(
             ).world_size <= 16 and (not self.dynamic_eplb)
             moe_comm_type = (MoECommType.MC2
-                             if num_tokens <= mc2_tokens_capacity else
+                             if num_tokens <= mc2_tokens_capacity and self.parallel_config.world_size_across_dp / self.parallel_config.pipeline_parallel_size >= 16 else
                              MoECommType.FUSED_ALLTOALL
                              if fused_all2all_enable else MoECommType.ALLTOALL)
         else:
@@ -2362,6 +2362,8 @@ class NPUModelRunner(GPUModelRunner):
                                    QKVParallelLinear, RowParallelLinear)):
                         module.weight.data = self._convert_torch_format(
                             module.weight.data)
+            if torch.distributed.get_rank() == 0:
+                print(self.model)
             if self.drafter:
                 logger.info("Loading drafter model...")
                 self.drafter.load_model(self.model)
