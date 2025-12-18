@@ -35,12 +35,12 @@ from vllm_ascend.compilation.acl_graph import (get_graph_params,
 from vllm_ascend.ops.shared_weight_layer import (
     is_hidden_layer, post_process_after_loading_for_shared_weight_series,
     reach_layer_for_shared_weight_series,
-    register_layer_to_shared_weight_series)
+    register_all_layers_to_shared_weight_series)
 from vllm_ascend.ops.weight_prefetch import maybe_npu_prefetch
 from vllm_ascend.quantization.w8a8 import AscendW8A8LinearMethod
 from vllm_ascend.utils import (ACL_FORMAT_FRACTAL_ND, ACL_FORMAT_FRACTAL_NZ,
-                               flashcomm2_o_shared_enabled, is_enable_nz,
-                               weak_ref_tensors)
+                                is_enable_nz,
+                                weak_ref_tensors)
 from vllm_ascend.worker.npu_input_batch import NPUInputBatch
 
 if TYPE_CHECKING:
@@ -737,18 +737,6 @@ class AscendMLAImpl(MLAAttentionImpl):
         self.kv_b_proj = kwargs['kv_b_proj']
         self.o_proj = kwargs['o_proj']
         self.vllm_config = get_current_vllm_config()
-        self.fc2_o_shared_enable = flashcomm2_o_shared_enabled()
-
-        if self.fc2_o_shared_enable and is_hidden_layer(
-                self.vllm_config, self.o_proj):
-            from vllm_ascend.distributed.parallel_state import \
-                get_shared_weight_group
-            register_layer_to_shared_weight_series(
-                series_name="o_proj",
-                group=get_shared_weight_group(),
-                layer=self.o_proj,
-                prefetch_step=1)
-
         self.kv_a_proj_with_mqa = kwargs.get('kv_a_proj_with_mqa', None)
         self.kv_a_layernorm = kwargs.get('kv_a_layernorm', None)
         self.q_a_layernorm = kwargs.get('q_a_layernorm', None)
@@ -762,6 +750,14 @@ class AscendMLAImpl(MLAAttentionImpl):
 
         self.speculative_config = self.vllm_config.speculative_config
         self.enable_mlapo = envs.VLLM_ASCEND_ENABLE_MLAPO
+        
+        self.layer_sharding_kwargs = []
+        for layer_name in get_ascend_config().layer_sharding:
+            if layer_name in kwargs:
+                self.layer_sharding_kwargs.append(kwargs[layer_name])
+            else:
+                raise ValueError(f"Layer '{layer_name}' not found in kwargs for layer sharding.")
+        register_all_layers_to_shared_weight_series(self.layer_sharding_kwargs)
 
     def _v_up_proj(self, x):
         # Convert from (B, N, L) to (N, B, L)
@@ -866,9 +862,9 @@ class AscendMLAImpl(MLAAttentionImpl):
         if self.enable_mlapo:
             self._process_weights_for_fused_mlapo(act_dtype)
 
-        if self.fc2_o_shared_enable and is_hidden_layer(
-                self.vllm_config, self.o_proj):
-            post_process_after_loading_for_shared_weight_series(self.o_proj)
+        for layer in self.layer_sharding_kwargs:
+            if is_hidden_layer(layer):
+                post_process_after_loading_for_shared_weight_series(layer)
 
     def _process_weights_for_fused_mlapo(self, act_dtype: torch.dtype):
         kv_a_proj_wt = self.fused_qkv_a_proj.weight.data[
@@ -1352,9 +1348,9 @@ class AscendMLAImpl(MLAAttentionImpl):
         kv_no_split = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(
             kv_no_split.contiguous(), need_gather_q_kv)
 
-        if self.fc2_o_shared_enable and is_hidden_layer(
-                self.vllm_config, self.o_proj):
-            reach_layer_for_shared_weight_series(self.o_proj)
+        for layer in self.layer_sharding_kwargs:
+            if is_hidden_layer(layer):
+                reach_layer_for_shared_weight_series(layer)
 
         decode_preprocess_res = None
         prefill_preprocess_res = None
@@ -1416,9 +1412,9 @@ class AscendMLAImpl(MLAAttentionImpl):
         assert output is not None, "Output tensor must be provided."
         if attn_metadata is None:
             # Profiling run.
-            if self.fc2_o_shared_enable and is_hidden_layer(
-                    self.vllm_config, self.o_proj):
-                reach_layer_for_shared_weight_series(self.o_proj)
+            for layer in self.layer_sharding_kwargs:
+                if is_hidden_layer(layer):
+                    reach_layer_for_shared_weight_series(layer)
             return output.fill_(0)
         num_actual_tokens = attn_metadata.num_actual_tokens
         assert attn_metadata.num_decodes is not None and \
