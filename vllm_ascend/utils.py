@@ -1119,11 +1119,6 @@ def dispose_layer(layer: Any):
             dispose_tensor(attr_value)
 
 
-def replace_layer(original_layer: Any, new_layer: Any):
-    original_layer.__class__ = new_layer.__class__
-    original_layer.__dict__ = new_layer.__dict__
-
-
 def check_kv_extra_config(vllm_config):
 
     def _check(name: str, config: dict):
@@ -1164,13 +1159,6 @@ def singleton(cls):
         return instances[cls]
 
     return get_instance
-
-
-@lru_cache(maxsize=1)
-def get_current_model_config():
-    from vllm.config import get_current_vllm_config
-    vllm_config = get_current_vllm_config()
-    return vllm_config.model_config
 
 
 #TODO: Temporarily use enable_sp to enable the dsa_cp feature of ds32. and subsequent updates will introduce new interfaces. --zzhx1
