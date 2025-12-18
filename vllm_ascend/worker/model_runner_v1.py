@@ -1438,6 +1438,7 @@ class NPUModelRunner(GPUModelRunner):
             # TODO: drop the EP-size guard when dispatch_ffn_combine supports larger EP sizes
             fused_all2all_enable = quant_type == "w8a8_dynamic" and get_ep_group(
             ).world_size <= 16 and (not self.dynamic_eplb)
+            fused_all2all_enable = False
             moe_comm_type = (MoECommType.MC2
                              if num_tokens <= mc2_tokens_capacity and self.parallel_config.world_size_across_dp / self.parallel_config.pipeline_parallel_size >= 16 else
                              MoECommType.FUSED_ALLTOALL
@@ -2240,6 +2241,9 @@ class NPUModelRunner(GPUModelRunner):
                 return self.model.compute_logits(hidden_states[dummy_indices])
 
             def dummy_drafter_compute_logits(hidden_states):
+                tl=hasattr(self.drafter, "model") and hasattr(
+                        self.drafter.model, "compute_logits")
+                print(f"rank:{get_dp_group().rank_in_group} zzh-debug-drafter-compute_logits: {need_dummy_logits}, {tl}, cl:{hidden_states[dummy_indices].shape}")
                 if not need_dummy_logits or self.drafter is None:
                     return
                 if hasattr(self.drafter, "model") and hasattr(

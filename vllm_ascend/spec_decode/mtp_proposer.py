@@ -8,7 +8,7 @@ import torch.nn.functional as F
 from vllm.config import (CUDAGraphMode, VllmConfig,
                          get_layers_from_vllm_config, set_current_vllm_config)
 from vllm.distributed import get_pcp_group
-from vllm.distributed.parallel_state import get_pp_group
+from vllm.distributed.parallel_state import get_pp_group, get_dp_group
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -313,9 +313,14 @@ class MtpProposer(Proposer):
                     positions = positions.squeeze(-1)
                     previous_hidden_states = torch.ops.vllm.maybe_pad_and_reduce(
                         previous_hidden_states)
-                self.model(input_ids=input_ids,
+                # torch.npu.synchronize()
+                print(f"rank:{get_dp_group().rank_in_group} mtp dummy_run: input_ids: {input_ids.shape}, positions: {positions.shape}, hidden_states: {previous_hidden_states.shape}", flush=True)
+                # torch.npu.synchronize()
+                dummy_outputs = self.model(input_ids=input_ids,
                            positions=positions,
                            hidden_states=previous_hidden_states)
+                # torch.npu.synchronize()
+                print(f"mtp dummy_run_outputs: rank:{get_dp_group().rank_in_group}: output: {dummy_outputs.shape}", flush=True)
                 forward_context = get_forward_context()
                 if forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL and \
                     not forward_context.capturing:
@@ -328,6 +333,8 @@ class MtpProposer(Proposer):
                         positions, True)
                     previous_hidden_states = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(
                         previous_hidden_states, True)
+                torch.npu.synchronize()
+                print(f"mtp dummy_run_logits: rank:{get_dp_group().rank_in_group}: output_logits: {previous_hidden_states.shape}", flush=True)
                 dummy_compute_logits(previous_hidden_states)
             if with_prefill:
                 break
@@ -804,10 +811,12 @@ class MtpProposer(Proposer):
                                 attn_metadata[layer_name].decode.seq_lens_list[:actual_size]
                             attn_metadata[layer_name].decode.block_table = \
                                 attn_metadata[layer_name].decode.block_table[:actual_size]
-
+                    print(f"rank:{get_dp_group().rank_in_group} mtp forward: input_ids: {input_ids.shape}, positions: {positions.shape}, hidden_states: {hidden_states.shape}", flush=True)
+                    torch.npu.synchronize()
                     hidden_states = self.model(input_ids=input_ids,
                                                positions=positions,
                                                hidden_states=hidden_states)
+                    print(f"mtp forward_outputs: rank:{get_dp_group().rank_in_group}: output: {hidden_states.shape}", flush=True)
                     forward_context = get_forward_context()
                     if forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL:
                         if self.vllm_config.model_config.use_mla and not self.use_sparse:
