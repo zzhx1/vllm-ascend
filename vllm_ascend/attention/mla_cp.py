@@ -31,8 +31,8 @@ from vllm_ascend.attention.common_cp import AscendPCPMetadata, CPChunkedContextM
 from vllm_ascend.compilation.acl_graph import (get_graph_params,
                                                get_mtp_graph_params,
                                                update_graph_params_workspaces)
-from vllm_ascend.ops.shared_weight_layer import (
-    is_hidden_layer, reach_layer_for_shared_weight_series)
+from vllm_ascend.ops.layer_shard_linear import (
+    is_hidden_layer, reach_layer_for_shard_weight_series)
 from vllm_ascend.ops.weight_prefetch import maybe_npu_prefetch
 from vllm_ascend.utils import weak_ref_tensors
 
@@ -412,7 +412,7 @@ class AscendMlaCPImpl(AscendMLAImpl):
             # Profiling run.
             if self.fc2_o_shared_enable and is_hidden_layer(
                     self.vllm_config, self.o_proj):
-                reach_layer_for_shared_weight_series(self.o_proj)
+                reach_layer_for_shard_weight_series(self.o_proj)
             return output.fill_(0)
 
         forward_context = get_forward_context()
@@ -537,7 +537,7 @@ class AscendMlaCPImpl(AscendMLAImpl):
 
         if self.fc2_o_shared_enable and is_hidden_layer(
                 self.vllm_config, self.o_proj):
-            reach_layer_for_shared_weight_series(self.o_proj)
+            reach_layer_for_shard_weight_series(self.o_proj)
 
         decode_preprocess_res = None
         prefill_preprocess_res = None
