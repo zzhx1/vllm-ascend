@@ -2,7 +2,7 @@
 
 ## Overview
 
-Fine-Grained Tensor Parallelism (Finegrained TP) extends standard tensor parallelism by enabling **independent tensor parallel sizes for different model components**. Instead of applying a single global `tensor_parallel_size` to all layers, Finegrained TP allows users to configure separate TP degrees for key modules—such as embedding, language model head (lm_head), attention output projection (oproj), and MLP blocks—via the `finegrained_tp_config` parameter.
+Fine-Grained Tensor Parallelism (Finegrained TP) extends standard tensor parallelism by enabling **independent tensor parallel sizes for different model components**. Instead of applying a single global `tensor_parallel_size` to all layers, Finegrained TP allows users to configure separate TP size for key modules—such as embedding, language model head (lm_head), attention output projection (oproj), and MLP blocks—via the `finegrained_tp_config` parameter.
 
 This capability supports heterogeneous parallelism strategies within a single model, providing finer control over weight distribution, memory layout, and communication patterns across devices. The feature is compatible with standard dense transformer architectures and integrates seamlessly into vLLM’s serving pipeline.
 
@@ -42,8 +42,8 @@ Finegrained TP is **model-agnostic** and supports all standard dense transformer
 
 ### Configuration Limit:
 The Fine-Grained TP size for any component must:
-  - Be **≤ the data-parallel (DP) degree**, and  
-  - **Evenly divide the DP degree** (i.e., `dp_size % tp_size == 0`) to ensure valid device assignment and communication grouping.
+  - Be **≤ the data-parallel (DP) size**, and  
+  - **Evenly divide the DP size** (i.e., `dp_size % tp_size == 0`) to ensure valid device assignment and communication grouping.
 > ⚠️ Violating these constraints will result in runtime errors or undefined behavior.
 
 ---
