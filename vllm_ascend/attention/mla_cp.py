@@ -410,8 +410,7 @@ class AscendMlaCPImpl(AscendMLAImpl):
         assert output is not None, "Output tensor must be provided."
         if attn_metadata is None:
             # Profiling run.
-            if self.fc2_o_shared_enable and is_hidden_layer(
-                    self.vllm_config, self.o_proj):
+            if self.fc2_o_shared_enable and is_hidden_layer(self.o_proj):
                 reach_layer_for_shard_weight_series(self.o_proj)
             return output.fill_(0)
 
@@ -535,8 +534,7 @@ class AscendMlaCPImpl(AscendMLAImpl):
         kv_no_split = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(
             kv_no_split.contiguous(), need_gather_q_kv)
 
-        if self.fc2_o_shared_enable and is_hidden_layer(
-                self.vllm_config, self.o_proj):
+        if self.fc2_o_shared_enable and is_hidden_layer(self.o_proj):
             reach_layer_for_shard_weight_series(self.o_proj)
 
         decode_preprocess_res = None
