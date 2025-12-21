@@ -1072,3 +1072,65 @@ def dispose_layer(layer: Any):
 def replace_layer(original_layer: Any, new_layer: Any):
     original_layer.__class__ = new_layer.__class__
     original_layer.__dict__ = new_layer.__dict__
+
+
+
+import torch.distributed as dist
+from vllm.logger import logger
+from datetime import datetime
+
+class Colors:
+    HEADER = '\033[95m'     # 紫色
+    OKBLUE = '\033[94m'     # 蓝色
+    OKCYAN = '\033[96m'     # 青色
+    OKGREEN = '\033[92m'    # 绿色
+    WARNING = '\033[93m'    # 黄色
+    FAIL = '\033[91m'       # 红色
+    ENDC = '\033[0m'        # 重置颜色
+    BOLD = '\033[1m'
+    UNDERLINE = '\033[4m'
+
+Colors.GREEN = Colors.OKGREEN
+Colors.BLUE = Colors.OKBLUE
+Colors.CYAN = Colors.OKCYAN
+
+RANK_COLORS = [
+    Colors.GREEN,  # rank 0
+    Colors.BLUE,  # rank 1
+    Colors.WARNING,  # rank 2
+    Colors.FAIL,  # rank 3
+    Colors.CYAN,  # rank 4
+    Colors.HEADER,  # rank 5
+]
+
+DEVICE_TENSOR = None
+
+def set_device_tensor(tensor):
+    global DEVICE_TENSOR
+    DEVICE_TENSOR = tensor
+
+def debug(message: str, *, in_graph=False):
+    """
+    彩色输出 debug 信息
+
+    Args:
+        *message: 要打印的消息
+        color: 输出颜色，默认为绿色
+    """
+    if in_graph:
+        torch.ops.vllm.acl_graph_print(message, DEVICE_TENSOR)
+        return
+
+    parts = []
+
+    if dist.is_initialized():
+        rank = dist.get_rank()
+        parts.append(f"{rank}")
+        color = RANK_COLORS[rank % len(RANK_COLORS)]
+    else:
+        color = Colors.GREEN
+
+    prefix = ",".join(parts)
+    now = datetime.now()
+    now_str = f"{now:%Y-%m-%d %H:%M:%S}.{now.microsecond:06d}"
+    logger.info(f"{color}>>>>ZZH[{now_str}]({prefix}): {str(message)}{Colors.ENDC}")
