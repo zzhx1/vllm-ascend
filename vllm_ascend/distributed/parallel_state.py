@@ -8,8 +8,8 @@ from vllm.distributed.parallel_state import (GroupCoordinator, get_dp_group,
                                              init_model_parallel_group)
 
 from vllm_ascend.ascend_config import get_ascend_config
-from vllm_ascend.utils import (enable_sp, flashcomm2_enable,
-                               flashcomm2_o_shared_enabled, enable_dsa_cp)
+from vllm_ascend.utils import (enable_dsa_cp, flashcomm2_enable,
+                               flashcomm2_o_shared_enabled)
 
 # Currently, mc2 op need their own group coordinator.
 _MC2: Optional[GroupCoordinator] = None
@@ -37,7 +37,6 @@ def init_ascend_model_parallel(parallel_config: ParallelConfig, ):
     assert torch.distributed.is_initialized()
     world_size = torch.distributed.get_world_size()
     backend = torch.distributed.get_backend(get_world_group().device_group)
-    vllm_config = get_current_vllm_config()
     global_tp_size = parallel_config.tensor_parallel_size
     global_dp_size = parallel_config.data_parallel_size
     global_pp_size = parallel_config.pipeline_parallel_size
@@ -180,7 +179,7 @@ def init_ascend_model_parallel(parallel_config: ParallelConfig, ):
                                          group_name=group_name)
 
     global _SHARED_WEIGHT
-    
+
     if enable_dsa_cp():
         _SHARED_WEIGHT = _create_shared_weight_group("CP_shared_weight")
 

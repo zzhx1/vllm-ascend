@@ -30,8 +30,8 @@ from vllm_ascend.ops.triton.rope import rope_forward_triton
 from vllm_ascend.ops.weight_prefetch import maybe_npu_prefetch
 from vllm_ascend.quantization.w8a8 import AscendW8A8LinearMethod
 from vllm_ascend.utils import (ACL_FORMAT_FRACTAL_ND, ACL_FORMAT_FRACTAL_NZ,
-                               _round_up, dispose_layer, enable_sp,
-                               is_enable_nz, replace_layer, enable_dsa_cp)
+                               _round_up, dispose_layer, enable_dsa_cp,
+                               is_enable_nz, replace_layer)
 from vllm_ascend.worker.npu_input_batch import InputBatch
 
 if TYPE_CHECKING:
@@ -147,6 +147,7 @@ class AscendSFAMetadataBuilder:
         self.sin_cache = None
 
         self.enable_sfa_cp = enable_dsa_cp()
+
     def reorder_batch(self, input_batch: "InputBatch",
                       scheduler_output: "SchedulerOutput") -> bool:
         # No need to reorder for Ascend SFA
