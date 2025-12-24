@@ -9,7 +9,8 @@ from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import get_tensor_model_parallel_world_size, get_tp_group
 from vllm.forward_context import get_forward_context
 from vllm.logger import logger
-from vllm.model_executor.layers.linear import (LinearBase, UnquantizedLinearMethod)
+from vllm.model_executor.layers.linear import (LinearBase,
+                                               UnquantizedLinearMethod)
 from vllm.triton_utils import HAS_TRITON
 from vllm.v1.attention.backends.utils import AttentionCGSupport
 
@@ -70,6 +71,9 @@ class SfaCpContext:
     slot_mapping_cp: torch.Tensor
     actual_seq_lengths_query: torch.Tensor
     actual_seq_lengths_key: torch.Tensor
+
+
+o_proj_full_weight: Optional[torch.Tensor]
 
 
 @dataclass
@@ -228,12 +232,10 @@ class AscendSFAMetadataBuilder:
 
             cos = cos[local_start:local_end_with_pad]
             sin = sin[local_start:local_end_with_pad]
-            slot_mapping_cp = torch.full(
-                size=(num_tokens_per_device,),
-                fill_value=-1,
-                dtype=slot_mapping.dtype,
-                device=slot_mapping.device
-            )
+            slot_mapping_cp = torch.full(size=(num_tokens_per_device, ),
+                                         fill_value=-1,
+                                         dtype=slot_mapping.dtype,
+                                         device=slot_mapping.device)
             assert cos.shape[0] == num_tokens_per_device, \
                 f"cos.shape[0] must be equal to num_tokens_per_device, \
                     got {cos.shape[0]} and {num_tokens_per_device}"
@@ -377,22 +379,26 @@ class AscendSFAImpl(MLAAttentionImpl):
         self.enable_sfa_cp = enable_dsa_cp()
         self.local_num_heads = self.num_heads
         self.vllm_config = get_current_vllm_config()
+        self.is_kv_producer = self.vllm_config.kv_transfer_config is not None and \
+            self.vllm_config.kv_transfer_config.is_kv_producer
+        self.is_kv_producer = True
         if self.enable_sfa_cp:
             self.local_num_heads = self.num_heads * self.tp_size
             from vllm_ascend.distributed.parallel_state import \
                 get_shared_weight_group
-            if is_hidden_layer(self.vllm_config, self.q_proj):
-                register_layer_to_shared_weight_series(
-                    series_name="q_proj",
-                    group=get_shared_weight_group(),
-                    layer=self.q_proj,
-                    prefetch_step=1)
-            if is_hidden_layer(self.vllm_config, self.o_proj):
-                register_layer_to_shared_weight_series(
-                    series_name="o_proj",
-                    group=get_shared_weight_group(),
-                    layer=self.o_proj,
-                    prefetch_step=1)
+            if self.is_kv_producer:
+                if is_hidden_layer(self.vllm_config, self.q_proj):
+                    register_layer_to_shared_weight_series(
+                        series_name="q_proj",
+                        group=get_shared_weight_group(),
+                        layer=self.q_proj,
+                        prefetch_step=1)
+                if is_hidden_layer(self.vllm_config, self.o_proj):
+                    register_layer_to_shared_weight_series(
+                        series_name="o_proj",
+                        group=get_shared_weight_group(),
+                        layer=self.o_proj,
+                        prefetch_step=1)
 
         # indexer param
         self.n_head: int = self.indexer.n_head  # 64
@@ -474,12 +480,28 @@ class AscendSFAImpl(MLAAttentionImpl):
         dispose_layer(self.kv_b_proj)
 
         if self.enable_sfa_cp:
-            if is_hidden_layer(self.vllm_config, self.q_proj):
-                post_process_after_loading_for_shared_weight_series(
-                    self.q_proj)
-            if is_hidden_layer(self.vllm_config, self.o_proj):
-                post_process_after_loading_for_shared_weight_series(
-                    self.o_proj)
+            if self.is_kv_producer:
+                if is_hidden_layer(self.vllm_config, self.q_proj):
+                    post_process_after_loading_for_shared_weight_series(
+                        self.q_proj)
+                if is_hidden_layer(self.vllm_config, self.o_proj):
+                    post_process_after_loading_for_shared_weight_series(
+                        self.o_proj)
+            else:
+                self.o_proj_full = self.o_proj.clone().detach()
+                o_proj = self.o_proj_full
+                global_tp_size = get_tp_group().world_size
+                o_proj.aclnn_input_scale = o_proj.aclnn_input_scale.repeat(
+                    global_tp_size)
+                o_proj.o_proj.aclnn_input_offset = o_proj.aclnn_input_offset.repeat(
+                    global_tp_size)
+                if o_proj_full_weight is None:
+                    sample = o_proj.weight
+                    o_proj_full_weight = torch.empty(
+                        (sample.shape[0] * global_tp_size, sample.shape[1]),
+                        dtype=sample.dtype,
+                        device=sample.device)
+                o_proj.weight.set_(o_proj_full_weight)
 
         if self.enable_mlapo:
             quant_method = getattr(
@@ -571,7 +593,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 cache_mode=cache_mode,
                 is_output_kv=True,
             )
-            return torch.cat([k_pe.view(-1, k_pe.shape[-1]), k_nope.view(-1, k_nope.shape[-1])], dim=1)
+            return k_pe, k_nope
         else:
             torch_npu.npu_kv_rmsnorm_rope_cache(
                 kv_no_split,
@@ -584,7 +606,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 epsilon=self.kv_a_layernorm.variance_epsilon,
                 cache_mode=cache_mode,
             )
-            return None
+            return None, None
 
     def rope_single(
         self,
@@ -768,10 +790,11 @@ class AscendSFAImpl(MLAAttentionImpl):
         if attn_metadata is None:
             # Profiling run.
             if self.enable_sfa_cp and not forward_context.in_profile_run:
-                if is_hidden_layer(self.vllm_config, self.q_proj):
-                    reach_layer_for_shared_weight_series(self.q_proj)
-                if is_hidden_layer(self.vllm_config, self.o_proj):
-                    reach_layer_for_shared_weight_series(self.o_proj)
+                if self.is_kv_producer:
+                    if is_hidden_layer(self.vllm_config, self.q_proj):
+                        reach_layer_for_shared_weight_series(self.q_proj)
+                    if is_hidden_layer(self.vllm_config, self.o_proj):
+                        reach_layer_for_shared_weight_series(self.o_proj)
             return output.fill_(0)
         has_prefill = attn_metadata.has_prefill
         cos = attn_metadata.cos
@@ -783,8 +806,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         # Inputs and outputs may be padded for CUDA graphs
         output_padded = output
 
-        k_pe_k_nope_no_split = None
-        kv_work = None
+        o_proj_full_work = None
 
         if self.enable_mlapo and not forward_context.with_prefill:
             hidden_states, ql_nope, q_pe, q_c = self._sfa_preprocess_decode(
@@ -824,9 +846,6 @@ class AscendSFAImpl(MLAAttentionImpl):
                 cos=cos,
                 sin=sin,
                 need_gather_q_kv=need_gather_q_kv)
-            k_work = None
-            if self.enable_sfa_cp:
-                k, k_work = all_gather_async(k, get_tp_group())
 
             if has_prefill:
                 wait_for_kv_layer_from_connector(layer_name)
@@ -838,16 +857,50 @@ class AscendSFAImpl(MLAAttentionImpl):
                 actual_seq_lengths_query = attn_metadata.sfa_cp_context.actual_seq_lengths_query
                 actual_seq_lengths_key = attn_metadata.sfa_cp_context.actual_seq_lengths_key
 
-            k_pe_k_nope_no_split = self.exec_kv(kv_no_split, cos, sin, kv_cache, slot_mapping)
+            k_pe, k_nope = self.exec_kv(kv_no_split, cos, sin, kv_cache,
+                                        slot_mapping)
+            ag_no_split = None
+            ag_work = None
             if self.enable_sfa_cp:
-                assert k_pe_k_nope_no_split is not None
-                k_pe_k_nope_no_split, kv_work = all_gather_async(k_pe_k_nope_no_split, get_tp_group())
+                assert k_pe is not None
+                assert k_nope is not None
+                ag_no_split, ag_work = all_gather_async(
+                    torch.cat([
+                        k_pe.view(-1, k_pe.shape[-1]),
+                        k_nope.view(-1, k_nope.shape[-1]),
+                        k.view(-1, k.shape[-1])
+                    ],
+                              dim=1), get_tp_group())
 
             ql_nope, q_pe = self._q_proj_and_k_up_proj(q_c)
             q_pe = self.rope_single(q_pe, cos, sin)
 
-            if k_work is not None:
-                k_work.wait()
+            if self.enable_sfa_cp:
+                if ag_work is not None:
+                    ag_work.wait()
+                if self.is_kv_producer:
+                    if is_hidden_layer(self.vllm_config, self.q_proj):
+                        reach_layer_for_shared_weight_series(self.q_proj)
+                    if is_hidden_layer(self.vllm_config, self.o_proj):
+                        reach_layer_for_shared_weight_series(self.o_proj)
+                else:
+                    o_proj_full_work = all_gather_async(
+                        self.o_proj.weight,
+                        get_tp_group(),
+                        output=o_proj_full_weight)
+                if kv_cache is not None:
+                    assert ag_no_split is not None
+                    k_pe, k_nope, k = ag_no_split.split([
+                        self.qk_rope_head_dim, self.kv_lora_rank, self.head_dim
+                    ],
+                                                        dim=-1)
+                    slot_mapping = attn_metadata.slot_mapping.view(-1, 1)
+                    torch_npu.npu_scatter_nd_update_(
+                        kv_cache[0].view(-1, k_nope.shape[-1]), slot_mapping,
+                        k_nope)
+                    torch_npu.npu_scatter_nd_update_(
+                        kv_cache[1].view(-1, k_pe.shape[-1]), slot_mapping,
+                        k_pe)
 
         topk_indices = self.indexer_select_post_process(
             x=hidden_states,
@@ -861,23 +914,6 @@ class AscendSFAImpl(MLAAttentionImpl):
             actual_seq_lengths_query=actual_seq_lengths_query,
             actual_seq_lengths_key=actual_seq_lengths_key,
             need_gather_q_kv=need_gather_q_kv)
-
-        if self.enable_sfa_cp:
-            if kv_work is not None:
-                kv_work.wait()
-            if is_hidden_layer(self.vllm_config, self.q_proj):
-                reach_layer_for_shared_weight_series(self.q_proj)
-            if is_hidden_layer(self.vllm_config, self.o_proj):
-                reach_layer_for_shared_weight_series(self.o_proj)
-            if kv_cache is not None:
-                assert k_pe_k_nope_no_split is not None
-                k_pe, k_nope = k_pe_k_nope_no_split.split([self.qk_rope_head_dim, self.kv_lora_rank], dim=-1)
-                slot_mapping = attn_metadata.slot_mapping.view(-1, 1)
-                torch_npu.npu_scatter_nd_update_(
-                    kv_cache[0].view(-1, k_nope.shape[-1]), slot_mapping, k_nope)
-                torch_npu.npu_scatter_nd_update_(
-                    kv_cache[1].view(-1, k_pe.shape[-1]), slot_mapping, k_pe)
-    
         attn_output = torch.ops._C_ascend.npu_sparse_flash_attention(
             query=ql_nope,
             key=kv_cache[0],
@@ -899,7 +935,12 @@ class AscendSFAImpl(MLAAttentionImpl):
                            dependency=attn_output,
                            max_size=MAX_O_PROJ_PREFETCH_SIZE,
                            enabled=self.enable_prefetch)
-        output[...] = self.o_proj(attn_output)[0]
+        if self.enable_sfa_cp and not self.is_kv_producer:
+            if o_proj_full_work is not None:
+                o_proj_full_work.wait()
+            output[...] = self.o_proj_full(attn_output)[0]
+        else:
+            output[...] = self.o_proj(attn_output)[0]
         return output_padded
 
     def indexer_select_pre_process(
