@@ -410,7 +410,7 @@ class AscendMlaCPImpl(AscendMLAImpl):
         assert output is not None, "Output tensor must be provided."
         if attn_metadata is None:
             # Profiling run.
-            
+
             # enable shard linear weight series reach dummmy_run
             for layer in (self.layer_sharding_kwargs or []):
                 if is_hidden_layer(layer):
