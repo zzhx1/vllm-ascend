@@ -8,7 +8,7 @@ from vllm.distributed.parallel_state import (GroupCoordinator, get_dp_group,
                                              init_model_parallel_group)
 
 from vllm_ascend.ascend_config import get_ascend_config
-from vllm_ascend.utils import (enable_dsa_cp, flashcomm2_enable,
+from vllm_ascend.utils import (enable_dsa_cp_with_shard, flashcomm2_enable,
                                flashcomm2_o_shared_enabled)
 
 # Currently, mc2 op need their own group coordinator.
@@ -180,7 +180,7 @@ def init_ascend_model_parallel(parallel_config: ParallelConfig, ):
 
     global _SHARED_WEIGHT
 
-    if enable_dsa_cp():
+    if enable_dsa_cp_with_shard():
         _SHARED_WEIGHT = _create_shared_weight_group("CP_shared_weight")
 
     # TODO: Extract and unify the logic across different communication group.

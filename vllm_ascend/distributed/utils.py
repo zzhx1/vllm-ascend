@@ -96,7 +96,8 @@ def fc3_all_gather_and_maybe_unpad_impl(x: torch.Tensor, ) -> torch.Tensor:
 
 def all_gather_async(input: torch.Tensor,
                      group: GroupCoordinator,
-                     output: Optional[torch.Tensor] = None):
+                     output: Optional[torch.Tensor] = None,
+                     async_op: bool = True):
     if group.world_size == 1:
         return input, None
     if output is None:
@@ -108,4 +109,4 @@ def all_gather_async(input: torch.Tensor,
     return output, dist.all_gather_into_tensor(output,
                                                input,
                                                group=group.device_group,
-                                               async_op=True)
+                                               async_op=async_op)

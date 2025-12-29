@@ -31,7 +31,7 @@ from vllm_ascend.ops.triton.rope import rope_forward_triton
 from vllm_ascend.ops.weight_prefetch import maybe_npu_prefetch
 from vllm_ascend.quantization.w8a8 import AscendW8A8LinearMethod
 from vllm_ascend.utils import (ACL_FORMAT_FRACTAL_ND, ACL_FORMAT_FRACTAL_NZ,
-                               _round_up, dispose_layer, enable_dsa_cp,
+                               _round_up, dispose_layer, enable_dsa_cp, enable_dsa_cp_with_shard,
                                is_enable_nz)
 from vllm_ascend.worker.npu_input_batch import InputBatch
 
@@ -71,9 +71,6 @@ class SfaCpContext:
     slot_mapping_cp: torch.Tensor
     actual_seq_lengths_query: torch.Tensor
     actual_seq_lengths_key: torch.Tensor
-
-
-o_proj_full_weight: Optional[torch.Tensor]
 
 
 @dataclass
@@ -151,6 +148,9 @@ class AscendSFAMetadataBuilder:
         self.sin_cache = None
 
         self.enable_sfa_cp = enable_dsa_cp()
+        max_num_reqs = vllm_config.scheduler_config.max_num_seqs
+        self.actual_seq_lengths_query = torch.zeros(max_num_reqs + 1, dtype=torch.int32, device=device)
+        self.actual_seq_lengths_key = torch.empty_like(self.actual_seq_lengths_query)
 
     def reorder_batch(self, input_batch: "InputBatch",
                       scheduler_output: "SchedulerOutput") -> bool:
@@ -217,7 +217,6 @@ class AscendSFAMetadataBuilder:
             pad_size = num_tokens_pad - cos.shape[0]
             assert cos.shape == sin.shape, \
                 f"cos.shape must be equal to sin.shape, got {cos.shape} and {sin.shape}"
-
             if pad_size > 0:
                 cos = nn.functional.pad(cos, (0, 0, 0, 0, 0, 0, 0, pad_size))
                 sin = nn.functional.pad(sin, (0, 0, 0, 0, 0, 0, 0, pad_size))
@@ -227,15 +226,18 @@ class AscendSFAMetadataBuilder:
                 slot_mapping = nn.functional.pad(slot_mapping,
                                                  (0, pad_size_slot),
                                                  value=-1)
+                slot_mapping_cp = torch.full(
+                    size=(num_tokens_per_device,),
+                    fill_value=-1,
+                    dtype=slot_mapping.dtype,
+                    device=slot_mapping.device
+                )
             else:
                 slot_mapping = slot_mapping[:num_tokens_pad]
+                slot_mapping_cp = slot_mapping[local_start:local_end_with_pad]
 
             cos = cos[local_start:local_end_with_pad]
             sin = sin[local_start:local_end_with_pad]
-            slot_mapping_cp = torch.full(size=(num_tokens_per_device, ),
-                                         fill_value=-1,
-                                         dtype=slot_mapping.dtype,
-                                         device=slot_mapping.device)
             assert cos.shape[0] == num_tokens_per_device, \
                 f"cos.shape[0] must be equal to num_tokens_per_device, \
                     got {cos.shape[0]} and {num_tokens_per_device}"
@@ -246,8 +248,9 @@ class AscendSFAMetadataBuilder:
                 f"slot_mapping.shape[0] must be equal to num_tokens_pad, \
                     got {slot_mapping.shape[0]} and {num_tokens_pad}"
 
-            actual_seq_lengths_query = torch.empty_like(cum_query_lens)
-            actual_seq_lengths_key = torch.empty_like(seq_lens)
+            actual_seq_lengths_query = self.actual_seq_lengths_query
+            actual_seq_lengths_key = self.actual_seq_lengths_key
+
             num_segs = cum_query_lens.shape[0]
             last_token = 0
             cum = 0
@@ -256,19 +259,22 @@ class AscendSFAMetadataBuilder:
                 global_end = cum_query_lens[i].item()
                 last_token = global_end
 
-                local_start = max(global_start, local_start)
-                local_end = min(global_end, local_end_with_pad)
-                num_local_tokens = local_end - local_start
+                req_local_start = max(global_start, local_start)
+                req_local_end = min(global_end, local_end_with_pad)
+                num_local_tokens = req_local_end - req_local_start
 
                 if num_local_tokens > 0:
                     cum += num_local_tokens
                     actual_seq_lengths_query[i] = cum
 
-                    offset = global_end - local_end
+                    offset = global_end - req_local_end
                     actual_seq_lengths_key[i] = seq_lens[i].item() - offset
                 else:
                     actual_seq_lengths_query[i] = cum
                     actual_seq_lengths_key[i] = 0
+            
+            actual_seq_lengths_query = actual_seq_lengths_query[:num_reqs]
+            actual_seq_lengths_key = actual_seq_lengths_key[:num_reqs]
 
             sfa_cp_context = SfaCpContext(
                 num_tokens=num_tokens,
@@ -321,6 +327,7 @@ class AscendSFAMetadataBuilder:
 
 
 class AscendSFAImpl(MLAAttentionImpl):
+    o_proj_full_pool: Optional[torch.Tensor] = None
     """
     NOTE: Please read the comment at the top of the file before trying to
     understand this class
@@ -377,16 +384,13 @@ class AscendSFAImpl(MLAAttentionImpl):
         assert self.indexer is not None, "Indexer is required for DSA."
 
         self.enable_sfa_cp = enable_dsa_cp()
+        self.enable_sfa_cp_with_shard = enable_dsa_cp_with_shard()
         self.local_num_heads = self.num_heads
         self.vllm_config = get_current_vllm_config()
-        self.is_kv_producer = self.vllm_config.kv_transfer_config is not None and \
-            self.vllm_config.kv_transfer_config.is_kv_producer
-        self.is_kv_producer = True
         if self.enable_sfa_cp:
             self.local_num_heads = self.num_heads * self.tp_size
-            from vllm_ascend.distributed.parallel_state import \
-                get_shared_weight_group
-            if self.is_kv_producer:
+            if self.enable_sfa_cp_with_shard:
+                from vllm_ascend.distributed.parallel_state import get_shared_weight_group
                 if is_hidden_layer(self.vllm_config, self.q_proj):
                     register_layer_to_shared_weight_series(
                         series_name="q_proj",
@@ -480,7 +484,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         dispose_layer(self.kv_b_proj)
 
         if self.enable_sfa_cp:
-            if self.is_kv_producer:
+            if self.enable_sfa_cp_with_shard:
                 if is_hidden_layer(self.vllm_config, self.q_proj):
                     post_process_after_loading_for_shared_weight_series(
                         self.q_proj)
@@ -488,20 +492,23 @@ class AscendSFAImpl(MLAAttentionImpl):
                     post_process_after_loading_for_shared_weight_series(
                         self.o_proj)
             else:
-                self.o_proj_full = self.o_proj.clone().detach()
-                o_proj = self.o_proj_full
-                global_tp_size = get_tp_group().world_size
-                o_proj.aclnn_input_scale = o_proj.aclnn_input_scale.repeat(
-                    global_tp_size)
-                o_proj.o_proj.aclnn_input_offset = o_proj.aclnn_input_offset.repeat(
-                    global_tp_size)
-                if o_proj_full_weight is None:
-                    sample = o_proj.weight
-                    o_proj_full_weight = torch.empty(
-                        (sample.shape[0] * global_tp_size, sample.shape[1]),
+                if AscendSFAImpl.o_proj_full_pool is None:
+                    sample = self.o_proj.weight
+                    AscendSFAImpl.o_proj_full_pool = torch.empty(
+                        (sample.shape[0] * self.tp_size, sample.shape[1]),
                         dtype=sample.dtype,
                         device=sample.device)
-                o_proj.weight.set_(o_proj_full_weight)
+                self.o_proj_tp_weight = self.o_proj.weight.clone().detach()
+                self.o_proj_tp_aclnn_input_scale = self.o_proj.aclnn_input_scale.clone().detach()
+                self.o_proj_tp_aclnn_input_scale_reciprocal = self.o_proj.aclnn_input_scale_reciprocal.clone().detach()
+                self.o_proj_tp_aclnn_input_offset = self.o_proj.aclnn_input_offset.clone().detach()
+                self.o_proj.weight.set_(self.o_proj_tp_weight)
+                self.o_proj.aclnn_input_scale.set_(self.o_proj_tp_aclnn_input_scale)
+                self.o_proj.aclnn_input_scale_reciprocal.set_(self.o_proj_tp_aclnn_input_scale_reciprocal)
+                self.o_proj.aclnn_input_offset.set_(self.o_proj_tp_aclnn_input_offset)
+                self.o_proj_full_aclnn_input_scale = self.o_proj.aclnn_input_scale.repeat(self.tp_size)
+                self.o_proj_full_aclnn_input_scale_reciprocal = self.o_proj.aclnn_input_scale_reciprocal.repeat(self.tp_size)
+                self.o_proj_full_aclnn_input_offset = self.o_proj.aclnn_input_offset.repeat(self.tp_size)
 
         if self.enable_mlapo:
             quant_method = getattr(
@@ -790,7 +797,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         if attn_metadata is None:
             # Profiling run.
             if self.enable_sfa_cp and not forward_context.in_profile_run:
-                if self.is_kv_producer:
+                if self.enable_sfa_cp_with_shard:
                     if is_hidden_layer(self.vllm_config, self.q_proj):
                         reach_layer_for_shared_weight_series(self.q_proj)
                     if is_hidden_layer(self.vllm_config, self.o_proj):
@@ -805,7 +812,6 @@ class AscendSFAImpl(MLAAttentionImpl):
             need_gather_q_kv = False
         # Inputs and outputs may be padded for CUDA graphs
         output_padded = output
-
         o_proj_full_work = None
 
         if self.enable_mlapo and not forward_context.with_prefill:
@@ -816,7 +822,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 need_gather_q_kv=need_gather_q_kv,
                 num_input_tokens=attn_metadata.num_input_tokens,
             )
-            q, k = self.indexer_select_pre_process(
+            q, k = self.indexer_select_necessary_process(
                 x=hidden_states,
                 qr=q_c,
                 cos=cos,
@@ -840,7 +846,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 kv_no_split = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(
                     kv_no_split.contiguous(), need_gather_q_kv)
 
-            q, k = self.indexer_select_pre_process(
+            q, k = self.indexer_select_necessary_process(
                 x=hidden_states,
                 qr=q_c,
                 cos=cos,
@@ -870,7 +876,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                         k_nope.view(-1, k_nope.shape[-1]),
                         k.view(-1, k.shape[-1])
                     ],
-                              dim=1), get_tp_group())
+                              dim=1), get_tp_group(), async_op=has_prefill)
 
             ql_nope, q_pe = self._q_proj_and_k_up_proj(q_c)
             q_pe = self.rope_single(q_pe, cos, sin)
@@ -878,16 +884,16 @@ class AscendSFAImpl(MLAAttentionImpl):
             if self.enable_sfa_cp:
                 if ag_work is not None:
                     ag_work.wait()
-                if self.is_kv_producer:
+                if self.enable_sfa_cp_with_shard:
                     if is_hidden_layer(self.vllm_config, self.q_proj):
                         reach_layer_for_shared_weight_series(self.q_proj)
                     if is_hidden_layer(self.vllm_config, self.o_proj):
                         reach_layer_for_shared_weight_series(self.o_proj)
-                else:
-                    o_proj_full_work = all_gather_async(
-                        self.o_proj.weight,
+                elif has_prefill:
+                    _, o_proj_full_work = all_gather_async(
+                        self.o_proj_tp_weight,
                         get_tp_group(),
-                        output=o_proj_full_weight)
+                        output=AscendSFAImpl.o_proj_full_pool)
                 if kv_cache is not None:
                     assert ag_no_split is not None
                     k_pe, k_nope, k = ag_no_split.split([
@@ -902,11 +908,16 @@ class AscendSFAImpl(MLAAttentionImpl):
                         kv_cache[1].view(-1, k_pe.shape[-1]), slot_mapping,
                         k_pe)
 
-        topk_indices = self.indexer_select_post_process(
+        if kv_cache is not None:
+            torch_npu.npu_scatter_nd_update_(kv_cache[2].view(-1, k.shape[-1]),
+                                             attn_metadata.slot_mapping.view(
+                                                 -1, 1),
+                                             k.view(-1,
+                                                    k.shape[-1]))  # b, s, n, d
+        topk_indices = self.indexer_select_optional_process(
             x=hidden_states,
             qr=q_c,
             q=q,
-            k=k,
             kv_cache=kv_cache,
             attn_metadata=attn_metadata,
             cos=cos,
@@ -935,15 +946,28 @@ class AscendSFAImpl(MLAAttentionImpl):
                            dependency=attn_output,
                            max_size=MAX_O_PROJ_PREFETCH_SIZE,
                            enabled=self.enable_prefetch)
-        if self.enable_sfa_cp and not self.is_kv_producer:
-            if o_proj_full_work is not None:
-                o_proj_full_work.wait()
-            output[...] = self.o_proj_full(attn_output)[0]
-        else:
-            output[...] = self.o_proj(attn_output)[0]
+        if self.enable_sfa_cp and not self.enable_sfa_cp_with_shard:
+            if has_prefill:
+                if o_proj_full_work is not None:
+                    o_proj_full_work.wait()
+                self.o_proj.weight.set_(AscendSFAImpl.o_proj_full_pool)
+                self.o_proj.aclnn_input_scale.set_(self.o_proj_full_aclnn_input_scale)
+                self.o_proj.aclnn_input_scale_reciprocal.set_(self.o_proj_full_aclnn_input_scale_reciprocal)
+                self.o_proj.aclnn_input_offset.set_(self.o_proj_full_aclnn_input_offset)
+                output[...] = self.o_proj.quant_method.quant_method.apply(self.o_proj, attn_output)
+                self.o_proj.weight.set_(self.o_proj_tp_weight)
+                self.o_proj.aclnn_input_scale.set_(self.o_proj_tp_aclnn_input_scale)
+                self.o_proj.aclnn_input_scale_reciprocal.set_(self.o_proj_tp_aclnn_input_scale_reciprocal)
+                self.o_proj.aclnn_input_offset.set_(self.o_proj_tp_aclnn_input_offset)
+                return output_padded
+            else:
+                send = attn_output.view(-1, self.tp_size, self.num_heads * self.v_head_dim).permute(1, 0, 2).reshape(-1, self.num_heads * self.v_head_dim)
+                attn_output = torch.empty_like(send)
+                torch.distributed.all_to_all_single(attn_output, send, group=get_tp_group().device_group)
+        output[...] = self.o_proj(attn_output)[0]
         return output_padded
 
-    def indexer_select_pre_process(
+    def indexer_select_necessary_process(
         self,
         x: torch.Tensor,
         qr: torch.Tensor,
@@ -984,12 +1008,11 @@ class AscendSFAImpl(MLAAttentionImpl):
 
         return q, k
 
-    def indexer_select_post_process(
+    def indexer_select_optional_process(
         self,
         x: torch.Tensor,
         qr: torch.Tensor,
         q: Optional[torch.Tensor],
-        k: torch.Tensor,
         kv_cache: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
         attn_metadata: M,
         cos: torch.Tensor,
@@ -1016,19 +1039,11 @@ class AscendSFAImpl(MLAAttentionImpl):
             q_pe = q_pe.squeeze(2)
             q = torch.cat([q_pe, q_nope], dim=-1)  # [b*s,64,128]
 
-        if kv_cache is not None:
-            torch_npu.npu_scatter_nd_update_(kv_cache[2].view(-1, k.shape[-1]),
-                                             attn_metadata.slot_mapping.view(
-                                                 -1, 1),
-                                             k.view(-1,
-                                                    k.shape[-1]))  # b, s, n, d
-
         weights, _ = self.weights_proj(x)
         weights = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(
             weights, need_gather_q_kv)
 
         block_table = attn_metadata.block_tables
-
         topk_indices = torch.ops._C_ascend.npu_lightning_indexer(
             query=q,
             key=kv_cache[2],
