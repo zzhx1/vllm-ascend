@@ -926,7 +926,9 @@ class AscendSFAImpl(MLAAttentionImpl):
                            dependency=attn_output,
                            max_size=MAX_O_PROJ_PREFETCH_SIZE,
                            enabled=self.enable_prefetch)
+        
         if self.enable_sfa_cp and not self.enable_sfa_cp_with_shard:
+            # Gather o_proj weight from all tp ranks
             if should_shard_weight:
                 if o_proj_full_work is not None:
                     o_proj_full_work.wait()
@@ -948,6 +950,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                     self.o_proj_tp_aclnn_input_offset)
                 return output_padded
             else:
+                # Alltoall for o_proj input activations in decode scenario
                 send = attn_output.view(
                     -1, self.tp_size,
                     self.num_heads * self.v_head_dim).permute(1, 0, 2).reshape(
