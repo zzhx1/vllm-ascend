@@ -36,6 +36,7 @@ How to extend a new linear op? Taking column parallel op as an example:
 Row parallel op follows a similar approach - inherit from RowColumnParallelOp and register the new class in get_row_parallel_op.
 """
 
+from types import SimpleNamespace
 from typing import Optional, Union
 
 import torch
@@ -56,7 +57,7 @@ from vllm_ascend.distributed.parallel_state import (get_flashcomm2_odp_group,
                                                     get_flashcomm2_otp_group,
                                                     get_mlp_tp_group,
                                                     get_otp_group)
-from vllm_ascend.utils import (dense_optim_enable, enable_sp,
+from vllm_ascend.utils import (dense_optim_enable, enable_dsa_cp, enable_dsa_cp_with_shard, enable_sp,
                                flashcomm2_enable,
                                get_flashcomm2_reorgnized_batch_ids,
                                matmul_allreduce_enable, mlp_tp_enable,
@@ -532,7 +533,7 @@ class SequenceRowParallelOp(CustomRowParallelOp):
             return tensor_model_parallel_all_reduce(output_parallel)
 
         pad_size = forward_context.pad_size
-        if pad_size > 0:
+        if pad_size > 0 and not (enable_dsa_cp() and "o_proj" in self.layer.prefix):
             x = F.pad(x, (0, 0, 0, pad_size))
 
         world_size = self.layer.tp_size
@@ -602,9 +603,64 @@ class SequenceRowParallelOp(CustomRowParallelOp):
         self.reduce_results = self.layer.reduce_results
 
 
+class ShardedCPRowParallelOp(CustomRowParallelOp):
+    # Initialize `RowParallelLinear` as a replicated linear layer.
+    def __init__(self, layer):
+        super().__init__(layer)
+    @property
+    def comm_group(self):
+        # fake comm group to bypass tp logic
+        return SimpleNamespace(world_size=1,
+                               rank_in_group=0,
+                               device_group=None)
+
+    def apply_impl(
+        self,
+        input_,
+    ) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
+        bias = self.bias if not self.skip_bias_add else None
+        # Matrix multiply.
+        assert self.quant_method is not None
+        output = self.quant_method.apply(self.layer, input_, bias)
+        output_bias = self.bias if self.skip_bias_add else None
+        if not self.return_bias:
+            return output
+        return output, output_bias
+
+    def update_attrs(self):
+        super().update_attrs()
+        self.reduce_results = False
+
+
+class ShardedCPColumnParallelOp(CustomColumnParallelOp):
+    # Initialize `ColumnParallelLinear` as a replicated linear layer.
+    @property
+    def comm_group(self):
+        # fake comm group to bypass tp logic
+        return SimpleNamespace(world_size=1,
+                               rank_in_group=0,
+                               device_group=None)
+
+    def apply_impl(
+        self,
+        input_,
+    ) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
+        bias = self.bias if not self.skip_bias_add else None
+        # Matrix multiply.
+        assert self.quant_method is not None
+        output = self.quant_method.apply(self.layer, input_, bias)
+        output_bias = self.bias if self.skip_bias_add else None
+        if not self.return_bias:
+            return output
+        return output, output_bias
+
+
 def _get_column_parallel_op(
-        prefix, layer
-) -> Optional[Union[MLPColumnParallelOp, SequenceColumnParallelOp]]:
+    prefix, layer
+) -> Optional[Union[MLPColumnParallelOp, SequenceColumnParallelOp,
+                    ShardedCPColumnParallelOp]]:
+    if enable_dsa_cp() and ("q_b_proj" in prefix or "kv_b_proj" in prefix):
+        return ShardedCPColumnParallelOp(layer)
     if mlp_tp_enable() and "gate_up_proj" in prefix:
         return MLPColumnParallelOp(layer)
     if enable_sp():
@@ -628,7 +684,10 @@ def _get_row_parallel_op(
     prefix, layer
 ) -> Optional[Union[MLPRowParallelOp, OProjRowParallelOp,
                     Flashcomm2OProjRowParallelOp, MatmulAllreduceRowParallelOp,
-                    SequenceRowParallelOp]]:
+                    SequenceRowParallelOp, ShardedCPRowParallelOp]]:
+    if enable_dsa_cp() and "o_proj" in prefix:
+        if enable_dsa_cp_with_shard():
+            return ShardedCPRowParallelOp(layer)
     if "down_proj" in prefix and mlp_tp_enable():
         return MLPRowParallelOp(layer)
     if "o_proj" in prefix and oproj_tp_enable():
