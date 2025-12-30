@@ -2349,6 +2349,8 @@ class NPUModelRunner(GPUModelRunner):
                                    QKVParallelLinear, RowParallelLinear)):
                         module.weight.data = self._convert_torch_format(
                             module.weight.data)
+            if torch.distributed.get_rank() == 0:
+                print(f"Model structure:\n{self.model}")
             if self.drafter:
                 logger.info("Loading drafter model...")
                 self.drafter.load_model(self.model)
