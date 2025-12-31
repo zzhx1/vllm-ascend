@@ -729,10 +729,11 @@ def get_parallel_op(disable_tp, prefix, layer, direct):
                       and shared_expert_dp_enabled()):
         return None, 0, 1
     custom_op: Optional[Union[MLPColumnParallelOp, SequenceColumnParallelOp,
-                              MLPRowParallelOp, OProjRowParallelOp,
-                              Flashcomm2OProjRowParallelOp,
+                              ShardedCPColumnParallelOp, MLPRowParallelOp,
+                              OProjRowParallelOp, Flashcomm2OProjRowParallelOp,
                               MatmulAllreduceRowParallelOp,
-                              SequenceRowParallelOp]] = None
+                              SequenceRowParallelOp, ShardedCPRowParallelOp,
+                              ShardedCPColumnParallelOp]] = None
     if direct == "row":
         custom_op = _get_row_parallel_op(prefix, layer)
 

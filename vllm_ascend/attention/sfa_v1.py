@@ -149,8 +149,6 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                 got {self.decode_threshold}"
 
         self.rope_dim = self.model_config.hf_text_config.qk_rope_head_dim
-        self.cos_cache = None
-        self.sin_cache = None
 
         self.enable_sfa_cp = enable_dsa_cp()
         max_num_reqs = vllm_config.scheduler_config.max_num_seqs
@@ -926,7 +924,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                            dependency=attn_output,
                            max_size=MAX_O_PROJ_PREFETCH_SIZE,
                            enabled=self.enable_prefetch)
-        
+
         if self.enable_sfa_cp and not self.enable_sfa_cp_with_shard:
             # Gather o_proj weight from all tp ranks
             if should_shard_weight:
