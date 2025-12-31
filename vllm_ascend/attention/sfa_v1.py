@@ -441,6 +441,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         dispose_layer(self.kv_b_proj)
 
         if self.enable_sfa_cp:
+            # if prefill-only and enable sfa cp with shard, we need to post-process shared weight here.
             if self.enable_sfa_cp_with_shard:
                 if is_hidden_layer(self.vllm_config, self.q_proj):
                     post_process_after_loading_for_shared_weight_series(
@@ -449,12 +450,14 @@ class AscendSFAImpl(MLAAttentionImpl):
                     post_process_after_loading_for_shared_weight_series(
                         self.o_proj)
             else:
+                # if is PD mix stage, using original TP o_proj weight, and also need to full gather for o_proj weight for prefill stage.
                 if AscendSFAImpl.o_proj_full_pool is None:
                     sample = self.o_proj.weight
                     AscendSFAImpl.o_proj_full_pool = torch.empty(
                         (sample.shape[0] * self.tp_size, sample.shape[1]),
                         dtype=sample.dtype,
                         device=sample.device)
+                # we should save parameters for tp mode
                 self.o_proj_tp_weight = self.o_proj.weight.clone().detach()
                 self.o_proj_tp_aclnn_input_scale = self.o_proj.aclnn_input_scale.clone(
                 ).detach()
@@ -462,6 +465,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 ).detach()
                 self.o_proj_tp_aclnn_input_offset = self.o_proj.aclnn_input_offset.clone(
                 ).detach()
+                # initially switch to tp mode for graph capture
                 self.o_proj.weight.set_(self.o_proj_tp_weight)
                 self.o_proj.aclnn_input_scale.set_(
                     self.o_proj_tp_aclnn_input_scale)
@@ -469,6 +473,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                     self.o_proj_tp_aclnn_input_scale_reciprocal)
                 self.o_proj.aclnn_input_offset.set_(
                     self.o_proj_tp_aclnn_input_offset)
+                # wo should also save parameters for full mode
                 self.o_proj_full_aclnn_input_scale = self.o_proj.aclnn_input_scale.repeat(
                     self.tp_size)
                 self.o_proj_full_aclnn_input_scale_reciprocal = self.o_proj.aclnn_input_scale_reciprocal.repeat(
@@ -783,7 +788,9 @@ class AscendSFAImpl(MLAAttentionImpl):
             need_gather_q_kv = False
         # Inputs and outputs may be padded for CUDA graphs
         output_padded = output
+        # all-gather o_proj weight for prefill stage of PD mix node
         o_proj_full_work = None
+        # if is PD mix stage, using original TP o_proj weight, and also need to full gather for o_proj weight for prefill stage.
         should_shard_weight = self.enable_sfa_cp_with_shard or attn_metadata.attn_state not in {
             AscendAttentionState.DecodeOnly, AscendAttentionState.SpecDecoding
         }
@@ -798,6 +805,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 need_gather_q_kv=need_gather_q_kv,
                 num_input_tokens=attn_metadata.num_input_tokens,
             )
+            # split indexer_select into `necessary` and `optional` process, such that the optional process can be skipped in short sequence case.
             q, k = self.indexer_select_necessary_process(
                 x=hidden_states,
                 qr=q_c,
@@ -822,6 +830,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 kv_no_split = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(
                     kv_no_split.contiguous(), need_gather_q_kv)
 
+            # Early indexer_select k for communication overlap
             q, k = self.indexer_select_necessary_process(
                 x=hidden_states,
                 qr=q_c,
@@ -841,8 +850,9 @@ class AscendSFAImpl(MLAAttentionImpl):
 
             k_pe, k_nope = self.exec_kv(kv_no_split, cos, sin, kv_cache,
                                         slot_mapping)
-            ag_no_split = None
-            ag_work = None
+
+            ag_no_split = None  # all-gather k_pe and k_nope and indexer's k for communication overlap
+            ag_work = None  # async work handle
             if self.enable_sfa_cp:
                 assert k_pe is not None
                 assert k_nope is not None
@@ -854,7 +864,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                     ],
                               dim=1),
                     get_tp_group(),
-                    async_op=should_shard_weight)
+                    async_op=should_shard_weight)  # only prefill stage need
 
             ql_nope, q_pe = self._q_proj_and_k_up_proj(q_c)
             q_pe = self.rope_single(q_pe, cos, sin)
@@ -862,12 +872,12 @@ class AscendSFAImpl(MLAAttentionImpl):
             if self.enable_sfa_cp:
                 if ag_work is not None:
                     ag_work.wait()
-                if self.enable_sfa_cp_with_shard:
+                if self.enable_sfa_cp_with_shard:  # broadcast o_proj weight for prefill Node
                     if is_hidden_layer(self.vllm_config, self.q_proj):
                         reach_layer_for_shared_weight_series(self.q_proj)
                     if is_hidden_layer(self.vllm_config, self.o_proj):
                         reach_layer_for_shared_weight_series(self.o_proj)
-                elif should_shard_weight:
+                elif should_shard_weight:  # all-gather o_proj weight for prefill stage of PD mix node
                     _, o_proj_full_work = all_gather_async(
                         self.o_proj_tp_weight,
                         get_tp_group(),
@@ -928,8 +938,10 @@ class AscendSFAImpl(MLAAttentionImpl):
         if self.enable_sfa_cp and not self.enable_sfa_cp_with_shard:
             # Gather o_proj weight from all tp ranks
             if should_shard_weight:
+                # wait for all-gather o_proj weight
                 if o_proj_full_work is not None:
                     o_proj_full_work.wait()
+                # switch o_proj into full mode
                 self.o_proj.weight.set_(AscendSFAImpl.o_proj_full_pool)
                 self.o_proj.aclnn_input_scale.set_(
                     self.o_proj_full_aclnn_input_scale)
@@ -937,8 +949,10 @@ class AscendSFAImpl(MLAAttentionImpl):
                     self.o_proj_full_aclnn_input_scale_reciprocal)
                 self.o_proj.aclnn_input_offset.set_(
                     self.o_proj_full_aclnn_input_offset)
+                # apply o_proj quant method
                 output[...] = self.o_proj.quant_method.quant_method.apply(
                     self.o_proj, attn_output)
+                # switch o_proj back to tp mode
                 self.o_proj.weight.set_(self.o_proj_tp_weight)
                 self.o_proj.aclnn_input_scale.set_(
                     self.o_proj_tp_aclnn_input_scale)
@@ -956,6 +970,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 attn_output = torch.empty_like(send)
                 torch.distributed.all_to_all_single(
                     attn_output, send, group=get_tp_group().device_group)
+
         output[...] = self.o_proj(attn_output)[0]
         return output_padded
 
