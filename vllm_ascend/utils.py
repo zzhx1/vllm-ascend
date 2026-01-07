@@ -1165,20 +1165,11 @@ def singleton(cls):
 @lru_cache(maxsize=1)
 def enable_dsa_cp() -> bool:
     from vllm.config import get_current_vllm_config
-
     vllm_config = get_current_vllm_config()
-    if vllm_config is None:
-        return False
-
-    model_config = getattr(vllm_config, "model_config", None)
-    if model_config is None:
-        return False
-
-    hf_text_config = getattr(model_config, "hf_text_config", None)
-    if hf_text_config is None:
-        return False
-
-    return hasattr(hf_text_config, "index_topk")
+    if hasattr(vllm_config.model_config, "hf_text_config") and hasattr(
+            vllm_config.model_config.hf_text_config, "index_topk"):
+        return True
+    return False
 
 
 @lru_cache(maxsize=1)
