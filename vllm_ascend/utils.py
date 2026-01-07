@@ -1168,3 +1168,13 @@ def enable_dsa_cp() -> bool:
     vllm_config = get_current_vllm_config()
     is_ds_v32 = hasattr(vllm_config.model_config.hf_config, "index_topk")
     return is_ds_v32 and enable_sp()
+
+
+@lru_cache(maxsize=1)
+def enable_dsa_cp_with_layer_shard() -> bool:
+    if not enable_dsa_cp():
+        return False
+    from vllm.config import get_current_vllm_config
+    vllm_config = get_current_vllm_config()
+    is_prefill_instance = vllm_config.kv_transfer_config is not None and vllm_config.kv_transfer_config.is_kv_producer
+    return is_prefill_instance
