@@ -34,7 +34,6 @@ class TestAscendSFABackend(TestBase):
 
 class TestAscendSFAMetadata(TestBase):
 
-    @patch("vllm_ascend.attention.sfa_v1.get_current_vllm_config")
     def test_ascend_sfa_metadata_default(self):
         has_prefill = True
         num_actual_tokens = 100
@@ -84,8 +83,6 @@ class TestAscendSFAMetadata(TestBase):
 
 class TestAscendSFAMetadataBuilder(TestBase):
 
-    @patch("vllm_ascend.attention.sfa_v1.get_current_vllm_config")
-    @patch("vllm_ascend.attention.sfa_v1.get_current_vllm_config")
     def test_ascend_sfa_metadata_builder_default(self):
         kv_cache_spec = MagicMock()
         layer_names = ["layer1", "layer2"]
@@ -107,9 +104,15 @@ class TestAscendSFAMetadataBuilder(TestBase):
     @patch("vllm_ascend.attention.sfa_v1.get_cos_and_sin_mla")
     @patch("vllm_ascend.attention.sfa_v1.enable_dsa_cp")
     def test_ascend_sfa_metadata_builder_build(self, mock_get_cos_and_sin_mla,
-                                               mock_enable_dsa_cp):
+                                               mock_enable_dsa_cp,
+                                               mock_get_current_vllm_config):
         mock_enable_dsa_cp.return_value = False
 
+        cfg = MagicMock()
+        cfg.model_config = MagicMock()
+        cfg.model_config.hf_text_config = MagicMock()
+
+        mock_get_current_vllm_config.return_value = cfg
         kv_cache_spec = MagicMock()
         layer_names = ["layer1", "layer2"]
         vllm_config = MagicMock()
@@ -155,7 +158,13 @@ class TestAscendSFAMetadataBuilder(TestBase):
     @patch("vllm_ascend.attention.sfa_v1.get_current_vllm_config")
     @patch("vllm_ascend.attention.sfa_v1.get_cos_and_sin_mla")
     def test_ascend_sfa_metadata_builder_build_for_graph_capture(
-            self, mock_get_cos_and_sin_mla):
+            self, mock_get_cos_and_sin_mla, mock_get_current_vllm_config):
+        cfg = MagicMock()
+        cfg.model_config = MagicMock()
+        cfg.model_config.hf_text_config = MagicMock()
+
+        mock_get_current_vllm_config.return_value = cfg
+
         kv_cache_spec = MagicMock()
         layer_names = ["layer1", "layer2"]
         vllm_config = MagicMock()
