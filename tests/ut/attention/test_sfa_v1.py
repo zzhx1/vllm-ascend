@@ -103,9 +103,12 @@ class TestAscendSFAMetadataBuilder(TestBase):
     @patch("vllm_ascend.attention.sfa_v1.get_current_vllm_config")
     @patch("vllm_ascend.attention.sfa_v1.get_cos_and_sin_mla")
     @patch("vllm_ascend.attention.sfa_v1.enable_dsa_cp")
-    def test_ascend_sfa_metadata_builder_build(self, mock_get_cos_and_sin_mla,
-                                               mock_enable_dsa_cp,
-                                               mock_get_current_vllm_config):
+    def test_ascend_sfa_metadata_builder_build(
+        self,
+        mock_enable_dsa_cp,
+        mock_get_cos_and_sin_mla,
+        mock_get_current_vllm_config,
+    ):
         mock_enable_dsa_cp.return_value = False
 
         cfg = MagicMock()
