@@ -33,6 +33,7 @@ class TestAscendSFABackend(TestBase):
 
 
 class TestAscendSFAMetadata(TestBase):
+
     @patch("vllm_ascend.attention.sfa_v1.get_current_vllm_config")
     def test_ascend_sfa_metadata_default(self):
         has_prefill = True
@@ -82,6 +83,7 @@ class TestAscendSFAMetadata(TestBase):
 
 
 class TestAscendSFAMetadataBuilder(TestBase):
+
     @patch("vllm_ascend.attention.sfa_v1.get_current_vllm_config")
     def test_ascend_sfa_metadata_builder_default(self):
         kv_cache_spec = MagicMock()
