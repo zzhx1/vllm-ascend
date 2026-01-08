@@ -85,6 +85,7 @@ class TestAscendSFAMetadata(TestBase):
 class TestAscendSFAMetadataBuilder(TestBase):
 
     @patch("vllm_ascend.attention.sfa_v1.get_current_vllm_config")
+    @patch("vllm_ascend.attention.sfa_v1.get_current_vllm_config")
     def test_ascend_sfa_metadata_builder_default(self):
         kv_cache_spec = MagicMock()
         layer_names = ["layer1", "layer2"]
@@ -102,6 +103,7 @@ class TestAscendSFAMetadataBuilder(TestBase):
         assert builder.device == device
         assert builder.vllm_config == vllm_config
 
+    @patch("vllm_ascend.attention.sfa_v1.get_current_vllm_config")
     @patch("vllm_ascend.attention.sfa_v1.get_cos_and_sin_mla")
     @patch("vllm_ascend.attention.sfa_v1.enable_dsa_cp")
     def test_ascend_sfa_metadata_builder_build(self, mock_get_cos_and_sin_mla,
@@ -150,6 +152,7 @@ class TestAscendSFAMetadataBuilder(TestBase):
         assert metadata.num_actual_tokens == common_attn_metadata.num_actual_tokens
         assert metadata.slot_mapping.shape == (100, 4, 1024)
 
+    @patch("vllm_ascend.attention.sfa_v1.get_current_vllm_config")
     @patch("vllm_ascend.attention.sfa_v1.get_cos_and_sin_mla")
     def test_ascend_sfa_metadata_builder_build_for_graph_capture(
             self, mock_get_cos_and_sin_mla):
