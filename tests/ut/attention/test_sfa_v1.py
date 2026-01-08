@@ -101,7 +101,11 @@ class TestAscendSFAMetadataBuilder(TestBase):
         assert builder.vllm_config == vllm_config
 
     @patch("vllm_ascend.attention.sfa_v1.get_cos_and_sin_mla")
-    def test_ascend_sfa_metadata_builder_build(self, mock_get_cos_and_sin_mla):
+    @patch("vllm_ascend.attention.sfa_v1.enable_dsa_cp")
+    def test_ascend_sfa_metadata_builder_build(self, mock_get_cos_and_sin_mla,
+                                               mock_enable_dsa_cp):
+        mock_enable_dsa_cp.return_value = False
+
         kv_cache_spec = MagicMock()
         layer_names = ["layer1", "layer2"]
         vllm_config = MagicMock()
