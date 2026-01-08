@@ -60,7 +60,6 @@ from vllm_ascend.distributed.parallel_state import (get_flashcomm2_odp_group,
                                                     get_flashcomm2_otp_group,
                                                     get_mlp_tp_group,
                                                     get_otp_group)
-from vllm_ascend.ops.layer_shard_linear import is_hidden_layer
 from vllm_ascend.utils import (enable_dsa_cp, enable_sp, flashcomm2_enable,
                                get_flashcomm2_reorgnized_batch_ids,
                                matmul_allreduce_enable, mlp_tp_enable,
@@ -663,8 +662,7 @@ def _get_column_parallel_op(
     prefix, layer
 ) -> Optional[Union[MLPColumnParallelOp, SequenceColumnParallelOp,
                     ShardedCPColumnParallelOp]]:
-    if enable_dsa_cp() and ("q_b_proj" in prefix or "kv_b_proj"
-                            in prefix) and is_hidden_layer(layer):
+    if enable_dsa_cp() and ("q_b_proj" in prefix or "kv_b_proj" in prefix):
         return ShardedCPColumnParallelOp(layer)
     if "gate_up_proj" in prefix and mlp_tp_enable(
     ) and not is_moe_layer(prefix):
@@ -691,7 +689,7 @@ def _get_row_parallel_op(
 ) -> Optional[Union[MLPRowParallelOp, OProjRowParallelOp,
                     Flashcomm2OProjRowParallelOp, MatmulAllreduceRowParallelOp,
                     SequenceRowParallelOp, ShardedCPRowParallelOp]]:
-    if enable_dsa_cp() and "o_proj" in prefix and is_hidden_layer(layer):
+    if enable_dsa_cp() and "o_proj" in prefix:
         return ShardedCPRowParallelOp(layer)
     if "down_proj" in prefix and mlp_tp_enable() and not is_moe_layer(prefix):
         return MLPRowParallelOp(layer)
