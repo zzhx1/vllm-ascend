@@ -1166,8 +1166,10 @@ def singleton(cls):
 def enable_dsa_cp() -> bool:
     from vllm.config import get_current_vllm_config
     vllm_config = get_current_vllm_config()
-    if hasattr(vllm_config.model_config, "hf_text_config") and hasattr(
-            vllm_config.model_config.hf_text_config, "index_topk"):
+    is_ds_v32 = hasattr(
+        vllm_config.model_config, "hf_text_config") and hasattr(
+            vllm_config.model_config.hf_text_config, "index_topk")
+    if is_ds_v32 and enable_sp():
         return True
     return False
 
