@@ -1,0 +1,30 @@
+name: Auto Sync Main Branch with Upstream
+
+# 触发条件：定时 + 手动，且只在 github-actions 分支生效
+on:
+  schedule:
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+  push:
+    branches: [github-actions]  # 仅当 github-actions 分支有提交时触发（可选）
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout your fork repo (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # 拉取所有分支
+          ref: main       # 始终操作 main 分支
+
+      - name: Add upstream and sync
+        run: |
+          git remote add upstream https://github.com/vllm-project/vllm-ascend.git
+          git fetch upstream
+          git checkout main
+          git reset --hard upstream/main  # 强制同步（替代 merge，无额外 commit）
+          git push origin main --force    # 强制推送到你的 fork 的 main 分支
