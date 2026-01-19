@@ -235,14 +235,9 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                 slot_mapping = nn.functional.pad(slot_mapping,
                                                  (0, pad_size_slot),
                                                  value=-1)
-                slot_mapping_cp = torch.full(size=(num_tokens_per_device, ),
-                                             fill_value=-1,
-                                             dtype=slot_mapping.dtype,
-                                             device=slot_mapping.device)
-
             else:
                 slot_mapping = slot_mapping[:num_tokens_pad]
-                slot_mapping_cp = slot_mapping[local_start:local_end_with_pad]
+            slot_mapping_cp = slot_mapping[local_start:local_end_with_pad]
 
             cos = cos[local_start:local_end_with_pad]
             sin = sin[local_start:local_end_with_pad]
@@ -775,8 +770,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             AscendAttentionState.DecodeOnly, AscendAttentionState.SpecDecoding
         }
 
-        # TODO(zzzzwwjj): In sfa, prefill and decode have the same calculation formula,
-        # so `has_prefill` here is not necessary.
+
         if self.enable_mlapo and num_input_tokens <= MLAPO_MAX_SUPPORTED_TOKENS:
             hidden_states, ql_nope, q_pe, q_c = self._sfa_preprocess_decode(
                 hidden_states=hidden_states,
