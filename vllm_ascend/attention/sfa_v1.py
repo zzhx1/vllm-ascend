@@ -913,13 +913,12 @@ class AscendSFAImpl(MLAAttentionImpl):
             # When using SFA-CP with pd mixed, o_proj has two cases:
             # 1. prefill: o_proj is a TP weight, we need to all-gather o_proj weight to switch TP=1.
             # 2. decode: all-to-all the hidden_state before the o_proj forward.
-            result = self._handle_o_proj_weight_switch_and_forward(
+            result, require_o_proj_forward = self._handle_o_proj_weight_switch_and_forward(
                 attn_output=attn_output,
                 output=output,
-                output_padded=output_padded,
                 o_proj_full_handle=o_proj_full_handle,
                 should_shard_weight=should_shard_weight)
-            if result is output_padded:
+            if not require_o_proj_forward:
                 return result
             attn_output = result
 
@@ -1072,11 +1071,10 @@ class AscendSFAImpl(MLAAttentionImpl):
         self.o_proj_full_aclnn_input_offset = self.o_proj.aclnn_input_offset.repeat(
             self.tp_size)
 
-    def _handle_o_proj_weight_switch_and_forward(
+    def x_handle_o_proj_weight_switch_and_forward(
             self, attn_output: torch.Tensor, output: torch.Tensor,
-            output_padded: torch.Tensor,
             o_proj_full_handle: Optional[torch.distributed.Work],
-            should_shard_weight: bool) -> Optional[torch.Tensor]:
+            should_shard_weight: bool) -> Tuple[torch.Tensor, bool]:
         """
         Handle o_proj weight switching between TP-mode and Full-mode, and execute forward computation.
         """
@@ -1108,7 +1106,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             self.o_proj.aclnn_input_offset.set_(
                 self.o_proj_tp_aclnn_input_offset)
 
-            return output_padded
+            return output, False
         else:
             # For decode scenario: perform all-to-all communication on o_proj input activations
             # Reshape for all-to-all: [batch * seq, tp_size, head_dim] -> [tp_size, batch * seq, head_dim]
@@ -1120,4 +1118,4 @@ class AscendSFAImpl(MLAAttentionImpl):
             torch.distributed.all_to_all_single(
                 attn_output, send, group=get_tp_group().device_group)
 
-            return attn_output
+            return attn_output, True
