@@ -80,7 +80,7 @@ class AscendSFABackend(AttentionBackend):
 
 
 @dataclass
-class SfaCpContext:
+class DSACPContext:
     num_tokens: int
     num_tokens_pad: int
     local_start: int
@@ -120,7 +120,7 @@ class AscendSFAMetadata:
     attn_mask: torch.Tensor = None
     # chunked prefill by default if no attn_states passed
     attn_state: AscendAttentionState = AscendAttentionState.ChunkedPrefill
-    sfa_cp_context: Optional[SfaCpContext] = None
+    dsa_cp_context: Optional[DSACPContext] = None
     reshape_cache_event: torch.npu.Event = None
 
 
@@ -162,7 +162,7 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
 
         self.attn_mask_builder = AttentionMaskBuilder(self.device)
         self.rope_dim = self.model_config.hf_text_config.qk_rope_head_dim
-        self.enable_sfa_cp = enable_dsa_cp()
+        self.enable_dsa_cp = enable_dsa_cp()
 
         max_num_reqs = vllm_config.scheduler_config.max_num_seqs
         self.actual_seq_lengths_query = torch.zeros(max_num_reqs + 1,
@@ -212,8 +212,8 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
 
         cos, sin = get_cos_and_sin_mla(input_positions, True)
 
-        sfa_cp_context = None
-        if self.enable_sfa_cp:
+        dsa_cp_context = None
+        if self.enable_dsa_cp:
             global_tp_size = get_tp_group().world_size
             num_tokens = num_input_tokens
             num_tokens_pad = _round_up(num_tokens, global_tp_size)
@@ -280,7 +280,7 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             actual_seq_lengths_query = actual_seq_lengths_query[:num_reqs]
             actual_seq_lengths_key = actual_seq_lengths_key[:num_reqs]
 
-            sfa_cp_context = SfaCpContext(
+            dsa_cp_context = DSACPContext(
                 num_tokens=num_tokens,
                 num_tokens_pad=num_tokens_pad,
                 local_start=local_start,
@@ -304,7 +304,7 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             block_tables=block_table,
             sin=sin[:num_input_tokens],
             cos=cos[:num_input_tokens],
-            sfa_cp_context=sfa_cp_context)
+            dsa_cp_context=dsa_cp_context)
 
     def build_for_graph_capture(
         self,
@@ -398,11 +398,11 @@ class AscendSFAImpl(MLAAttentionImpl):
         self.k_norm = self.indexer.k_norm
         self.cp_size = 1
 
-        self.enable_sfa_cp = enable_dsa_cp()
-        self.enable_sfa_cp_prefill_only = enable_dsa_cp_with_layer_shard()
-        if self.enable_sfa_cp:
+        self.enable_dsa_cp = enable_dsa_cp()
+        self.enable_dsa_cp_prefill_only = enable_dsa_cp_with_layer_shard()
+        if self.enable_dsa_cp:
             self.local_num_heads = self.num_heads * self.tp_size
-        if self.enable_sfa_cp_prefill_only:
+        if self.enable_dsa_cp_prefill_only:
             self.layer_sharding_kwargs = []
             for layer_name in (get_ascend_config().layer_sharding or []):
                 if layer_name in kwargs:
@@ -447,8 +447,8 @@ class AscendSFAImpl(MLAAttentionImpl):
 
         # Dispose kv_b_proj since it is replaced by W_UV and W_UK_T to save memory
         dispose_layer(self.kv_b_proj)
-        if self.enable_sfa_cp:
-            if self.enable_sfa_cp_prefill_only:
+        if self.enable_dsa_cp:
+            if self.enable_dsa_cp_prefill_only:
                 for layer in (self.layer_sharding_kwargs or []):
                     if is_hidden_layer(layer):
                         post_process_after_loading_for_shard_weight_series(
@@ -469,7 +469,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                     "Currently mlapo only supports W8A8 quantization in SFA scenario."
                     "Some layers in your model are not quantized with W8A8,"
                     "thus mlapo is disabled for these layers.")
-            if self.enable_sfa_cp:
+            if self.enable_dsa_cp:
                 reasons.append("Currently mlapo does not support SFA with CP,"
                                "thus mlapo is disabled for these layers.")
             if reasons:
@@ -534,7 +534,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             B, N, S, self.kv_lora_rank + self.qk_rope_head_dim)
         cache_mode = "PA"
 
-        if self.enable_sfa_cp:
+        if self.enable_dsa_cp:
             _, _, k_pe, k_nope = torch_npu.npu_kv_rmsnorm_rope_cache(
                 kv_no_split,
                 self.kv_a_layernorm.weight,
@@ -747,7 +747,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         forward_context = get_forward_context()
         if attn_metadata is None:
             # Profiling run.
-            if self.enable_sfa_cp_prefill_only and not forward_context.in_profile_run:
+            if self.enable_dsa_cp_prefill_only and not forward_context.in_profile_run:
                 for layer in (self.layer_sharding_kwargs or []):
                     if is_hidden_layer(layer):
                         reach_layer_for_shard_weight_series(layer)
@@ -757,7 +757,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         sin = attn_metadata.sin
         actual_seq_lengths_query = attn_metadata.cum_query_lens
         actual_seq_lengths_key = attn_metadata.seq_lens
-        if self.enable_sfa_cp:
+        if self.enable_dsa_cp:
             need_gather_q_kv = False
         # Inputs and outputs may be padded for CUDA graphs
         num_input_tokens = attn_metadata.num_input_tokens
@@ -766,7 +766,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         # all-gather o_proj weight for prefill stage of PD mix node
         o_proj_full_handle = None
         # if is PD mix stage, using original TP o_proj weight, and also need to full gather for o_proj weight for prefill stage.
-        should_shard_weight = self.enable_sfa_cp_prefill_only or attn_metadata.attn_state not in {
+        should_shard_weight = self.enable_dsa_cp_prefill_only or attn_metadata.attn_state not in {
             AscendAttentionState.DecodeOnly, AscendAttentionState.SpecDecoding
         }
 
@@ -813,16 +813,16 @@ class AscendSFAImpl(MLAAttentionImpl):
             wait_for_kv_layer_from_connector(layer_name)
 
             slot_mapping = attn_metadata.slot_mapping
-            if self.enable_sfa_cp:
-                assert attn_metadata.sfa_cp_context is not None
-                slot_mapping = attn_metadata.sfa_cp_context.slot_mapping_cp
-                actual_seq_lengths_query = attn_metadata.sfa_cp_context.actual_seq_lengths_query
-                actual_seq_lengths_key = attn_metadata.sfa_cp_context.actual_seq_lengths_key
+            if self.enable_dsa_cp:
+                assert attn_metadata.dsa_cp_context is not None
+                slot_mapping = attn_metadata.dsa_cp_context.slot_mapping_cp
+                actual_seq_lengths_query = attn_metadata.dsa_cp_context.actual_seq_lengths_query
+                actual_seq_lengths_key = attn_metadata.dsa_cp_context.actual_seq_lengths_key
 
             k_pe, k_nope = self.exec_kv(kv_no_split, cos, sin, kv_cache,
                                         slot_mapping)
 
-            if self.enable_sfa_cp:
+            if self.enable_dsa_cp:
                 assert k_pe is not None
                 assert k_nope is not None
                 # support all_gather kv async for communication calculation overlap
@@ -839,11 +839,11 @@ class AscendSFAImpl(MLAAttentionImpl):
             ql_nope, q_pe = self._q_proj_and_k_up_proj(q_c)
             q_pe = self.rope_single(q_pe, cos, sin)
 
-            if self.enable_sfa_cp:
+            if self.enable_dsa_cp:
                 if kv_ag_handle is not None:
                     kv_ag_handle.wait()
 
-                if self.enable_sfa_cp_prefill_only:
+                if self.enable_dsa_cp_prefill_only:
                     for layer in (self.layer_sharding_kwargs or []):
                         if is_hidden_layer(layer):
                             reach_layer_for_shard_weight_series(layer)
@@ -909,7 +909,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                            max_size=MAX_O_PROJ_PREFETCH_SIZE,
                            enabled=self.enable_prefetch)
 
-        if self.enable_sfa_cp and not self.enable_sfa_cp_prefill_only:
+        if self.enable_dsa_cp and not self.enable_dsa_cp_prefill_only:
             # When using SFA-CP with pd mixed, o_proj has two cases:
             # 1. prefill: o_proj is a TP weight, we need to all-gather o_proj weight to switch TP=1.
             # 2. decode: all-to-all the hidden_state before the o_proj forward.
