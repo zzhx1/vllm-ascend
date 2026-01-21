@@ -1071,7 +1071,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         self.o_proj_full_aclnn_input_offset = self.o_proj.aclnn_input_offset.repeat(
             self.tp_size)
 
-    def x_handle_o_proj_weight_switch_and_forward(
+    def _handle_o_proj_weight_switch_and_forward(
             self, attn_output: torch.Tensor, output: torch.Tensor,
             o_proj_full_handle: Optional[torch.distributed.Work],
             should_shard_weight: bool) -> Tuple[torch.Tensor, bool]:
