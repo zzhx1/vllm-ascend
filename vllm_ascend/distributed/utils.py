@@ -53,3 +53,35 @@ def all_gather_async(input: torch.Tensor,
                                                input,
                                                group=group.device_group,
                                                async_op=async_op)
+    
+
+def all_gather_async_fake(input_: torch.Tensor,
+                     comm_group: GroupCoordinator,
+                     output_: Optional[torch.Tensor] = None,
+                     dim: int = -1,
+                     async_op: bool = False):
+    if comm_group.world_size == 1:
+        return input_, None
+    if dim < 0:
+        dim += input_.dim()
+    input_size = input_.size()
+    if output_ is None:
+        output_size = (input_size[0] * comm_group.world_size, ) + input_size[1:]
+        output_ = torch.empty(output_size,
+                             dtype=input_.dtype,
+                             device=input_.device)
+    
+    all_gather_event = dist.all_gather_into_tensor(output_,
+                                               input_,
+                                               group=comm_group.device_group,
+                                               async_op=async_op)
+    
+    output_tensor = output_.reshape((comm_group.world_size,) + input_size)
+    output_tensor = output_tensor.movedim(0, dim)
+    output_tensor = output_tensor.reshape(
+        input_size[:dim]
+        + (comm_group.world_size * input_size[dim],)
+        + input_size[dim + 1 :]
+    )
+    return output_tensor, all_gather_event
+    

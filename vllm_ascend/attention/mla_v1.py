@@ -52,7 +52,9 @@ else:
         AttentionBackend, AttentionCGSupport, MLAAttentionImpl)
     from vllm.v1.attention.backends.utils import PAD_SLOT_ID  # type: ignore
 # isort: on
-
+from vllm.distributed.parallel_state import get_tp_group
+from vllm_ascend.ops.shard_linear_manger import trigger_sharded_linear_full_weight_reconstruction
+from vllm.model_executor.models.utils import extract_layer_index
 MAX_O_PROJ_PREFETCH_SIZE = 16 * 1024 * 1024
 BUILD_METADATA_STEP_PREFILL = 0
 BUILD_METADATA_STEP_DECODE = 1
@@ -1440,6 +1442,9 @@ class AscendMLAImpl(MLAAttentionImpl):
             if is_hidden_layer(layer):
                 reach_layer_for_shard_weight_series(layer)
 
+        curr_layer_idx = extract_layer_index(self.o_proj.prefix)
+        trigger_sharded_linear_full_weight_reconstruction(curr_layer_idx, get_tp_group())
+        
         decode_preprocess_res = None
         prefill_preprocess_res = None
         if has_prefill:
@@ -1501,6 +1506,8 @@ class AscendMLAImpl(MLAAttentionImpl):
             decode_preprocess_res, prefill_preprocess_res = self._mla_preprocess(
                 layer_name, hidden_states, kv_cache, attn_metadata,
                 need_gather_q_kv)
+        
+        
         if decode_preprocess_res is not None:
             # MLA Preprocess for decoding
             output_decode = self._forward_decode(decode_preprocess_res.ql_nope,
@@ -1522,12 +1529,17 @@ class AscendMLAImpl(MLAAttentionImpl):
                 prefill_preprocess_res.value, kv_cache, attn_metadata)
 
             o_proj_input[num_decode_tokens:num_actual_tokens] = output_prefill
-        # O proj
-        MAX_O_PROJ_PREFETCH_SIZE = 16 * 1024 * 1024
-        maybe_npu_prefetch(inputs=self.o_proj.weight,
-                           dependency=o_proj_input,
-                           max_size=MAX_O_PROJ_PREFETCH_SIZE,
-                           enabled=self.enable_prefetch)
+        # # O proj
+        # MAX_O_PROJ_PREFETCH_SIZE = 16 * 1024 * 1024
+        # maybe_npu_prefetch(inputs=self.o_proj.weight,
+        #                    dependency=o_proj_input,
+        #                    max_size=MAX_O_PROJ_PREFETCH_SIZE,
+        #                    enabled=self.enable_prefetch)
+        
+        
+        
+        
+        o_proj_input = get_tp_group().all_gather(o_proj_input)
 
         output[...] = self.o_proj(o_proj_input,
                                   is_prefill=prefill_preprocess_res

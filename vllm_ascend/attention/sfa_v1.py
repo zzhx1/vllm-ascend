@@ -400,7 +400,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         self.weights_proj = self.indexer.weights_proj
         self.k_norm = self.indexer.k_norm
         self.cp_size = 1
-
+        
         self.enable_dsa_cp = enable_dsa_cp()
         self.enable_dsa_cp_prefill_only = enable_dsa_cp_with_layer_shard()
         if self.enable_dsa_cp:
