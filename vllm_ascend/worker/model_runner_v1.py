@@ -2337,6 +2337,17 @@ class NPUModelRunner(GPUModelRunner):
 
         with DeviceMemoryProfiler() as m:  # noqa: SIM117
             self.model = get_model(vllm_config=self.vllm_config)
+            
+
+            from vllm_ascend.ops.shard_linear_manger import init_shard_linear_manager
+            fake_layer_sharding = ["o_proj"]
+            init_shard_linear_manager(self.model, fake_layer_sharding)
+            
+            if torch.distributed.get_rank() == 0:
+                print(f"-----------------------------------", flush=True)
+                print(f"Model structure: {self.model}", flush=True)
+                print(f"-----------------------------------", flush=True)
+            
             if self.dynamic_eplb:
                 model_register(self.model, self.model_config)
             if self.drafter:

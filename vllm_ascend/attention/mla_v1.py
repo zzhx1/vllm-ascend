@@ -37,6 +37,9 @@ from vllm_ascend.quantization.w8a8 import AscendW8A8LinearMethod
 from vllm_ascend.utils import (ACL_FORMAT_FRACTAL_ND, maybe_trans_nz,
                                vllm_version_is, weak_ref_tensors)
 from vllm_ascend.worker.npu_input_batch import NPUInputBatch
+from vllm.distributed.parallel_state import get_tp_group
+from vllm_ascend.ops.shard_linear_manger import get_shard_linear_manager
+from vllm.model_executor.models.utils import extract_layer_index
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
@@ -754,6 +757,7 @@ class AscendMLAImpl(MLAAttentionImpl):
                     f"Layer '{layer_name}' not found in kwargs for layer sharding, skipping sharding configuration"
                 )
         register_all_layers_to_shard_weight_series(self.layer_sharding_kwargs)
+        
 
     def _v_up_proj(self, x):
         # Convert from (N, B, L)/(N, B, 1, L) to (N, B, L)
@@ -1439,6 +1443,12 @@ class AscendMLAImpl(MLAAttentionImpl):
         for layer in (self.layer_sharding_kwargs or []):
             if is_hidden_layer(layer):
                 reach_layer_for_shard_weight_series(layer)
+        
+        shard_linear_manager = get_shard_linear_manager()
+        curr_layer_idx = extract_layer_index(self.o_proj.prefix)
+        if shard_linear_manager is not None:
+            for linear in shard_linear_manager:
+                linear.reach_full_weight(curr_layer_idx, get_tp_group())
 
         decode_preprocess_res = None
         prefill_preprocess_res = None
@@ -1522,17 +1532,19 @@ class AscendMLAImpl(MLAAttentionImpl):
                 prefill_preprocess_res.value, kv_cache, attn_metadata)
 
             o_proj_input[num_decode_tokens:num_actual_tokens] = output_prefill
+        
         # O proj
-        MAX_O_PROJ_PREFETCH_SIZE = 16 * 1024 * 1024
-        maybe_npu_prefetch(inputs=self.o_proj.weight,
-                           dependency=o_proj_input,
-                           max_size=MAX_O_PROJ_PREFETCH_SIZE,
-                           enabled=self.enable_prefetch)
-
+        if get_shard_linear_manager() is not None:
+            o_proj_input = get_tp_group().all_gather(o_proj_input)
+        else:
+            MAX_O_PROJ_PREFETCH_SIZE = 16 * 1024 * 1024
+            maybe_npu_prefetch(inputs=self.o_proj.weight,
+                               dependency=o_proj_input,
+                               max_size=MAX_O_PROJ_PREFETCH_SIZE,
+                               enabled=self.enable_prefetch)
         output[...] = self.o_proj(o_proj_input,
                                   is_prefill=prefill_preprocess_res
                                   is not None)[0]
-
         del o_proj_input
 
         if has_prefill:
