@@ -824,7 +824,7 @@ class AscendSFAImpl(MLAAttentionImpl):
 
             k_pe, k_nope = self.exec_kv(kv_no_split, cos, sin, kv_cache,
                                         slot_mapping)
-
+            
             if self.enable_dsa_cp:
                 assert k_pe is not None
                 assert k_nope is not None
