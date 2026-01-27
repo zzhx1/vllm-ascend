@@ -37,7 +37,9 @@ from vllm_ascend.quantization.w8a8 import AscendW8A8LinearMethod
 from vllm_ascend.utils import (ACL_FORMAT_FRACTAL_ND, _round_up, dispose_layer,
                                enable_dsa_cp, enable_dsa_cp_with_layer_shard, maybe_trans_nz, vllm_version_is)
 from vllm_ascend.worker.npu_input_batch import NPUInputBatch
-
+from vllm.distributed.parallel_state import get_tp_group
+from vllm_ascend.ops.shard_linear_manger import trigger_sharded_linear_full_weight_reconstruction
+from vllm.model_executor.models.utils import extract_layer_index
 # isort: off
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
@@ -405,17 +407,19 @@ class AscendSFAImpl(MLAAttentionImpl):
         self.enable_dsa_cp_prefill_only = enable_dsa_cp_with_layer_shard()
         if self.enable_dsa_cp:
             self.local_num_heads = self.num_heads * self.tp_size
-        if self.enable_dsa_cp_prefill_only:
-            self.layer_sharding_kwargs = []
-            for layer_name in (get_ascend_config().layer_sharding or []):
-                if layer_name in kwargs:
-                    self.layer_sharding_kwargs.append(kwargs[layer_name])
-                else:
-                    logger.warning_once(
-                        f"[SFAImpl init] Layer '{layer_name}' not found in kwargs for layer sharding, skipping sharding configuration"
-                    )
-            register_all_layers_to_shard_weight_series(
-                self.layer_sharding_kwargs)
+            
+        # if self.enable_dsa_cp_prefill_only:
+        #     self.layer_sharding_kwargs = []
+        #     for layer_name in (get_ascend_config().layer_sharding or []):
+        #         if layer_name in kwargs:
+        #             self.layer_sharding_kwargs.append(kwargs[layer_name])
+        #         else:
+        #             logger.warning_once(
+        #                 f"[SFAImpl init] Layer '{layer_name}' not found in kwargs for layer sharding, skipping sharding configuration"
+        #             )
+        #     register_all_layers_to_shard_weight_series(
+        #         self.layer_sharding_kwargs)
+        
 
     def process_weights_after_loading(self, act_dtype: torch.dtype):
         # NOTE: We currently do not support quant kv_b_proj.
@@ -450,14 +454,15 @@ class AscendSFAImpl(MLAAttentionImpl):
 
         # Dispose kv_b_proj since it is replaced by W_UV and W_UK_T to save memory
         dispose_layer(self.kv_b_proj)
-        if self.enable_dsa_cp:
-            if self.enable_dsa_cp_prefill_only:
-                for layer in (self.layer_sharding_kwargs or []):
-                    if is_hidden_layer(layer):
-                        post_process_after_loading_for_shard_weight_series(
-                            layer)
-            else:
-                self._init_o_proj_tp_full_params()
+        
+        # if self.enable_dsa_cp:
+        #     if self.enable_dsa_cp_prefill_only:
+        #         for layer in (self.layer_sharding_kwargs or []):
+        #             if is_hidden_layer(layer):
+        #                 post_process_after_loading_for_shard_weight_series(
+        #                     layer)
+        #     else:
+        #         self._init_o_proj_tp_full_params()
 
         if self.enable_mlapo:
             quant_method = getattr(
@@ -750,10 +755,10 @@ class AscendSFAImpl(MLAAttentionImpl):
         forward_context = get_forward_context()
         if attn_metadata is None:
             # Profiling run.
-            if self.enable_dsa_cp_prefill_only and not forward_context.in_profile_run:
-                for layer in (self.layer_sharding_kwargs or []):
-                    if is_hidden_layer(layer):
-                        reach_layer_for_shard_weight_series(layer)
+            # if self.enable_dsa_cp_prefill_only and not forward_context.in_profile_run:
+            #     for layer in (self.layer_sharding_kwargs or []):
+            #         if is_hidden_layer(layer):
+            #             reach_layer_for_shard_weight_series(layer)
             return output.fill_(0)
 
         cos = attn_metadata.cos
@@ -846,15 +851,17 @@ class AscendSFAImpl(MLAAttentionImpl):
                 if kv_ag_handle is not None:
                     kv_ag_handle.wait()
 
-                if self.enable_dsa_cp_prefill_only:
-                    for layer in (self.layer_sharding_kwargs or []):
-                        if is_hidden_layer(layer):
-                            reach_layer_for_shard_weight_series(layer)
-                elif should_shard_weight:
-                    _, o_proj_full_handle = all_gather_async(
-                        self.o_proj_tp_weight,
-                        get_tp_group(),
-                        output=AscendSFAImpl.o_proj_full_pool)
+                curr_layer_idx = extract_layer_index(self.o_proj.prefix)
+                trigger_sharded_linear_full_weight_reconstruction(curr_layer_idx, get_tp_group())
+                # if self.enable_dsa_cp_prefill_only:
+                #     for layer in (self.layer_sharding_kwargs or []):
+                #         if is_hidden_layer(layer):
+                #             reach_layer_for_shard_weight_series(layer)
+                # elif should_shard_weight:
+                #     _, o_proj_full_handle = all_gather_async(
+                #         self.o_proj_tp_weight,
+                #         get_tp_group(),
+                #         output=AscendSFAImpl.o_proj_full_pool)
 
                 if kv_cache is not None:
                     assert fused_kv_no_split is not None
@@ -912,18 +919,19 @@ class AscendSFAImpl(MLAAttentionImpl):
                            max_size=MAX_O_PROJ_PREFETCH_SIZE,
                            enabled=self.enable_prefetch)
 
-        if self.enable_dsa_cp and not self.enable_dsa_cp_prefill_only:
-            # When using SFA-CP with pd mixed, o_proj has two cases:
-            # 1. prefill: o_proj is a TP weight, we need to all-gather o_proj weight to switch TP=1.
-            # 2. decode: all-to-all the hidden_state before the o_proj forward.
-            result, require_o_proj_forward = self._handle_o_proj_weight_switch_and_forward(
-                attn_output=attn_output,
-                output=output,
-                o_proj_full_handle=o_proj_full_handle,
-                should_shard_weight=should_shard_weight)
-            if not require_o_proj_forward:
-                return result
-            attn_output = result
+        # if self.enable_dsa_cp and not self.enable_dsa_cp_prefill_only:
+        #     # When using SFA-CP with pd mixed, o_proj has two cases:
+        #     # 1. prefill: o_proj is a TP weight, we need to all-gather o_proj weight to switch TP=1.
+        #     # 2. decode: all-to-all the hidden_state before the o_proj forward.
+        #     result, require_o_proj_forward = self._handle_o_proj_weight_switch_and_forward(
+        #         attn_output=attn_output,
+        #         output=output,
+        #         o_proj_full_handle=o_proj_full_handle,
+        #         should_shard_weight=should_shard_weight)
+        #     if not require_o_proj_forward:
+        #         return result
+        #     attn_output = result
+        
 
         output[...] = self.o_proj(attn_output)[0]
 

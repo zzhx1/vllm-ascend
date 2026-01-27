@@ -2339,9 +2339,10 @@ class NPUModelRunner(GPUModelRunner):
         with DeviceMemoryProfiler() as m:  # noqa: SIM117
             self.model = get_model(vllm_config=self.vllm_config)
      
-                
-            fake_layer_sharding = ["o_proj"]
-            init_sharded_linear_full_weight_restore(self.model, fake_layer_sharding)
+            layer_sharding_config = self.ascend_config.layer_sharding
+            # layer_sharding_config = ["o_proj"]
+            if layer_sharding_config is not None:
+                init_sharded_linear_full_weight_restore(self.model, layer_sharding_config)
             
             if torch.distributed.get_rank() == 0:
                 print(f"-----------------------------------", flush=True)

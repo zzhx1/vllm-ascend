@@ -699,7 +699,8 @@ def _get_column_parallel_op(
     prefix, layer
 ) -> Optional[Union[MLPColumnParallelOp, SequenceColumnParallelOp,
                     ShardedCPColumnParallelOp, Flashcomm2OshardQKVParallelOp]]:
-    if enable_dsa_cp() and ("q_b_proj" in prefix or "kv_b_proj" in prefix):
+    # if enable_dsa_cp() and ("q_b_proj" in prefix or "kv_b_proj" in prefix):
+    if enable_dsa_cp() and ("kv_b_proj" in prefix):
         return ShardedCPColumnParallelOp(layer)
     if "gate_up_proj" in prefix and mlp_tp_enable(
     ) and not is_moe_layer(prefix):
@@ -729,8 +730,8 @@ def _get_row_parallel_op(
 ) -> Optional[Union[MLPRowParallelOp, OProjRowParallelOp,
                     Flashcomm2OProjRowParallelOp, MatmulAllreduceRowParallelOp,
                     SequenceRowParallelOp, ShardedCPRowParallelOp]]:
-    if enable_dsa_cp_with_layer_shard() and "o_proj" in prefix:
-        return ShardedCPRowParallelOp(layer)
+    # if enable_dsa_cp_with_layer_shard() and "o_proj" in prefix:
+    #     return ShardedCPRowParallelOp(layer)
     if "down_proj" in prefix and mlp_tp_enable() and not is_moe_layer(prefix):
         return MLPRowParallelOp(layer)
     if "o_proj" in prefix and oproj_tp_enable():
