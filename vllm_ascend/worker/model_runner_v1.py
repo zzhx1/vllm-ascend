@@ -105,7 +105,7 @@ from vllm_ascend.utils import (AscendDeviceType, ProfileExecuteDuration,
                                set_weight_prefetch_method, vllm_version_is)
 from vllm_ascend.worker.npu_input_batch import NPUInputBatch
 from vllm_ascend.worker.pcp_utils import PCPManager
-from vllm_ascend.ops.shard_linear_manger import init_sharded_linear_full_weight_restore
+from vllm_ascend.ops.shard_linear_manger import init_sharded_linear_mangers
 
 from vllm_ascend.ascend_forward_context import (  # isort: skip
     MoECommType, get_mc2_tokens_capacity, select_moe_comm_method,
@@ -2339,10 +2339,10 @@ class NPUModelRunner(GPUModelRunner):
         with DeviceMemoryProfiler() as m:  # noqa: SIM117
             self.model = get_model(vllm_config=self.vllm_config)
      
-            layer_sharding_config = self.ascend_config.layer_sharding
-            # layer_sharding_config = ["o_proj"]
+            # layer_sharding_config = self.ascend_config.layer_sharding
+            layer_sharding_config = ["o_proj"]
             if layer_sharding_config is not None:
-                init_sharded_linear_full_weight_restore(self.model, layer_sharding_config)
+                init_sharded_linear_mangers(self.model, layer_sharding_config)
             
             if torch.distributed.get_rank() == 0:
                 print(f"-----------------------------------", flush=True)

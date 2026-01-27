@@ -38,7 +38,7 @@ from vllm_ascend.utils import (ACL_FORMAT_FRACTAL_ND, _round_up, dispose_layer,
                                enable_dsa_cp, enable_dsa_cp_with_layer_shard, maybe_trans_nz, vllm_version_is)
 from vllm_ascend.worker.npu_input_batch import NPUInputBatch
 from vllm.distributed.parallel_state import get_tp_group
-from vllm_ascend.ops.shard_linear_manger import trigger_sharded_linear_full_weight_reconstruction
+from vllm_ascend.ops.shard_linear_manger import trigger_sharded_linear_full_weight_prefetch
 from vllm.model_executor.models.utils import extract_layer_index
 # isort: off
 if TYPE_CHECKING:
@@ -852,7 +852,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                     kv_ag_handle.wait()
 
                 curr_layer_idx = extract_layer_index(self.o_proj.prefix)
-                trigger_sharded_linear_full_weight_reconstruction(curr_layer_idx, get_tp_group())
+                trigger_sharded_linear_full_weight_prefetch(curr_layer_idx, get_tp_group())
                 # if self.enable_dsa_cp_prefill_only:
                 #     for layer in (self.layer_sharding_kwargs or []):
                 #         if is_hidden_layer(layer):

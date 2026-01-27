@@ -53,7 +53,7 @@ else:
     from vllm.v1.attention.backends.utils import PAD_SLOT_ID  # type: ignore
 # isort: on
 from vllm.distributed.parallel_state import get_tp_group
-from vllm_ascend.ops.shard_linear_manger import trigger_sharded_linear_full_weight_reconstruction
+from vllm_ascend.ops.shard_linear_manger import trigger_sharded_linear_full_weight_prefetch
 from vllm.model_executor.models.utils import extract_layer_index
 MAX_O_PROJ_PREFETCH_SIZE = 16 * 1024 * 1024
 BUILD_METADATA_STEP_PREFILL = 0
@@ -1443,7 +1443,7 @@ class AscendMLAImpl(MLAAttentionImpl):
                 reach_layer_for_shard_weight_series(layer)
 
         curr_layer_idx = extract_layer_index(self.o_proj.prefix)
-        trigger_sharded_linear_full_weight_reconstruction(curr_layer_idx, get_tp_group())
+        trigger_sharded_linear_full_weight_prefetch(curr_layer_idx, get_tp_group())
         
         decode_preprocess_res = None
         prefill_preprocess_res = None

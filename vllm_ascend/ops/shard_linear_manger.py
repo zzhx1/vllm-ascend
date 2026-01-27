@@ -11,11 +11,11 @@ from vllm_ascend.distributed.utils import all_gather_async
 from vllm.distributed.parallel_state import GroupCoordinator
 
 # Global registry: manages full-weight restoration for layers under the "shard linear" feature
-SHARDED_LINEAR_FULL_WEIGHT_RESTORE_MANAGERS: Optional[List["ShardedLinearFullWeightRestorer"]] = None
+SHARDED_LINEAR_MANAGERS: Optional[List["ShardedLinearFullWeightRestorer"]] = None
 
 
-def get_sharded_linear_full_weight_restore_managers():
-    return SHARDED_LINEAR_FULL_WEIGHT_RESTORE_MANAGERS
+def get_sharded_linear_managers():
+    return SHARDED_LINEAR_MANAGERS
 
 
 def dispose_tensor(x: torch.Tensor):
@@ -25,51 +25,49 @@ def dispose_tensor(x: torch.Tensor):
         
         
 
-def init_sharded_linear_full_weight_restore(model, sharded_linear_patterns: List[str]):
+def init_sharded_linear_mangers(model, layer_shard_config: List[str]):
     """
     Initialize full-weight restore logic for linear layers participating in the 'shard linear' feature.
     
     Args:
         model: The model instance to inspect.
-        sharded_linear_patterns: List of suffixes (e.g., ["o_proj"]) identifying target linear layers.
+        layer_shard_config: List of suffixes (e.g., ["o_proj"]) identifying target linear layers.
     """
-    global SHARDED_LINEAR_FULL_WEIGHT_RESTORE_MANAGERS
-    if SHARDED_LINEAR_FULL_WEIGHT_RESTORE_MANAGERS is not None:
+    global SHARDED_LINEAR_MANAGERS
+    if SHARDED_LINEAR_MANAGERS is not None:
         return  # Already initialized
 
-    SHARDED_LINEAR_FULL_WEIGHT_RESTORE_MANAGERS = []
-    for pattern in sharded_linear_patterns:
-        logger.info(f"Initializing layer sharding with pattern: {pattern}")
-        restorer = ShardedLinearFullWeightRestorer(pattern)
+    SHARDED_LINEAR_MANAGERS = []
+    for module_name in layer_shard_config:
+        logger.info(f"Initializing layer sharding with module name: {module_name}")
+        restorer = ShardedLinearFullWeightRestorer(module_name)
         for name, module in model.named_modules():
-            if name.endswith(pattern):
+            if name.endswith(module_name):
                 restorer.register_sharded_linear(module)
-        if torch.distributed.get_rank() == 0:
-            print(f"zzh-debug: init restorer {restorer.__dict__}")
-        SHARDED_LINEAR_FULL_WEIGHT_RESTORE_MANAGERS.append(restorer)
+
+        SHARDED_LINEAR_MANAGERS.append(restorer)
 
 
 
 
-def trigger_sharded_linear_full_weight_reconstruction(curr_layer_idx: int, comm_group):
+def trigger_sharded_linear_full_weight_prefetch(curr_layer_idx: int, comm_group):
     """
-    Trigger asynchronous all-gather to reconstruct full weights for current layer's sharded linear modules.
+    Trigger asynchronous all-gather to prefetch full weights for current layer's sharded linear modules.
     """
-    if SHARDED_LINEAR_FULL_WEIGHT_RESTORE_MANAGERS is None:
+    if SHARDED_LINEAR_MANAGERS is None:
         return
-    for restorer in SHARDED_LINEAR_FULL_WEIGHT_RESTORE_MANAGERS:
-        print(f"start reconstruction for pattern {restorer.sharded_linear_pattern}")
-        restorer.initiate_full_weight_reconstruction(curr_layer_idx, comm_group)
+    for restorer in SHARDED_LINEAR_MANAGERS:
+        restorer.prefetch_next_layer_full_weight(curr_layer_idx, comm_group)
 
 
 class ShardedLinearFullWeightRestorer:
-    def __init__(self, sharded_linear_pattern: str):
-        self.sharded_linear_pattern = sharded_linear_pattern
+    def __init__(self, sharded_linear_module: str):
+        self.sharded_linear_module = sharded_linear_module
         self.tp_size = get_tp_group().world_size
         self.layer_idx_to_sharded_linear: Dict[int, LinearBase] = {}
 
         # Runtime state during full-weight reconstruction cycle
-        self.sharded_weight: Optional[torch.Tensor] = None      # local TP shard of weight
+        self.tp_sharded_weight: Optional[torch.Tensor] = None      # local TP shard of weight
         self.full_weight: Optional[torch.Tensor] = None         # reconstructed full weight
         self.gather_work: Optional[dist.Work] = None            # async all-gather handle
         self.gather_dim: int = -1                               # dimension along which to gather
@@ -116,23 +114,22 @@ class ShardedLinearFullWeightRestorer:
                     "no partitioned dimension found in weight shape {weight_shape}."
                 )
 
-    def initiate_full_weight_reconstruction(self, curr_layer_idx: int, comm_group):
+    def prefetch_next_layer_full_weight(self, curr_layer_idx: int, comm_group):
         linear = self.layer_idx_to_sharded_linear[curr_layer_idx]
-        self.sharded_weight = linear.weight.clone().detach()
-        assert self.sharded_weight is not None, "sharded weight should be clone before reconstruction"
+        self.tp_sharded_weight = linear.weight.clone().detach()
+        assert self.tp_sharded_weight is not None, "sharded weight should be clone before prefetch"
         if comm_group.world_size == 1:
-            self.full_weight = self.sharded_weight
+            self.full_weight = self.tp_sharded_weight
             self.gather_work = None
             return
 
         assert self.full_weight is None, "Previous full_weight not cleaned up"
         self.full_weight, self.gather_work = all_gather_async_for_sharded_linear(
-            input_=self.sharded_weight,
+            input_=self.tp_sharded_weight,
             comm_group=comm_group,
             dim=self.gather_dim,
-            async_op=False
+            async_op=True
         )
-        print(f"zzh-debug-2: all_gather_event {self.gather_work}, output_size {self.full_weight.size()}")
         
     def _sync_and_reshape_full_weight(self):
         """Wait for async gather and reshape into original full tensor layout."""
@@ -142,7 +139,7 @@ class ShardedLinearFullWeightRestorer:
 
         assert self.full_weight is not None, "Full weight not gathered"
         if self.tp_size > 1:
-            input_tensor = self.sharded_weight
+            input_tensor = self.tp_sharded_weight
             dim = self.gather_dim % input_tensor.dim()  # normalize negative index
 
             # Reshape from flat gathered tensor back to logical full shape
@@ -164,7 +161,7 @@ class ShardedLinearFullWeightRestorer:
             linear.weight.set_(self.full_weight)
             result = linear._original_forward(*args, **kwargs)
             # Restore original sharded weight
-            linear.weight.set_(self.sharded_weight)
+            linear.weight.set_(self.tp_sharded_weight)
             # Clean up full weight to avoid memory leak
             dispose_tensor(self.full_weight)
             self.full_weight = None
@@ -172,6 +169,13 @@ class ShardedLinearFullWeightRestorer:
         return forward_with_full_weight
                
         
+
+
+
+
+
+
+
 
 def all_gather_async_for_sharded_linear(input_: torch.Tensor,
                      comm_group: GroupCoordinator,
@@ -192,7 +196,6 @@ def all_gather_async_for_sharded_linear(input_: torch.Tensor,
                                                input_,
                                                group=comm_group.device_group,
                                                async_op=async_op)
-    print(f"zzh-debug: all_gather_event {all_gather_event}, output_size {output_.size()}")
     return output_, all_gather_event
 
 
