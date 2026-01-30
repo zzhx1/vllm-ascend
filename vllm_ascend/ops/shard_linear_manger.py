@@ -7,7 +7,6 @@ from vllm.model_executor.layers.linear import LinearBase
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.logger import logger
 from vllm.distributed.parallel_state import get_tp_group
-from vllm_ascend.distributed.utils import all_gather_async
 from vllm.distributed.parallel_state import GroupCoordinator
 
 # Global registry: manages full-weight restoration for layers under the "shard linear" feature
@@ -48,8 +47,6 @@ def init_sharded_linear_mangers(model, layer_shard_config: List[str]):
         SHARDED_LINEAR_MANAGERS.append(restorer)
 
 
-
-
 def trigger_sharded_linear_full_weight_prefetch(curr_layer_idx: int, comm_group):
     """
     Trigger asynchronous all-gather to prefetch full weights for current layer's sharded linear modules.
@@ -60,22 +57,29 @@ def trigger_sharded_linear_full_weight_prefetch(curr_layer_idx: int, comm_group)
         restorer.prefetch_next_layer_full_weight(curr_layer_idx, comm_group)
 
 
+class _LayerState:
+    def __init__(self, linear_module: LinearBase, 
+                 tp_sharded_weight: torch.Tensor, 
+                 full_weight: Optional[torch.Tensor] = None, 
+                 gather_work = None):
+        self.linear_module = linear_module
+        self.tp_sharded_weight = tp_sharded_weight
+        self.full_weight = full_weight
+        self.gather_work = gather_work
+
 class ShardedLinearFullWeightRestorer:
     def __init__(self, sharded_linear_module: str):
         self.sharded_linear_module = sharded_linear_module
         self.tp_size = get_tp_group().world_size
-        self.layer_idx_to_sharded_linear: Dict[int, LinearBase] = {}
-
-        # Runtime state during full-weight reconstruction cycle
-        self.tp_sharded_weight: Optional[torch.Tensor] = None      # local TP shard of weight
-        self.full_weight: Optional[torch.Tensor] = None         # reconstructed full weight
-        self.gather_work: Optional[dist.Work] = None            # async all-gather handle
+        self.layer_idx_to_state: Dict[int, _LayerState] = {}
         self.gather_dim: int = -1                               # dimension along which to gather
 
     def register_sharded_linear(self, linear: LinearBase):
+             
         layer_idx = extract_layer_index(linear.prefix)
-        self.layer_idx_to_sharded_linear[layer_idx] = linear
-
+        tp_sharded_weight = linear.weight.clone().detach()
+        self.layer_idx_to_state[layer_idx] = _LayerState(linear, tp_sharded_weight)
+        
         # Wrap forward to temporarily use full weight (core of "shard linear" feature)
         linear._original_forward = linear.forward
         linear.forward = self._create_full_weight_wrapped_forward(linear)
@@ -113,68 +117,70 @@ class ShardedLinearFullWeightRestorer:
                     f"Cannot determine gather dimension for {linear.prefix}: "
                     "no partitioned dimension found in weight shape {weight_shape}."
                 )
+        # prefetch full weight for first layer
+        if layer_idx == 0:
+            self.prefetch_next_layer_full_weight(layer_idx-1, get_tp_group(), async_op=False)
+        
 
-    def prefetch_next_layer_full_weight(self, curr_layer_idx: int, comm_group):
-        linear = self.layer_idx_to_sharded_linear[curr_layer_idx]
-        self.tp_sharded_weight = linear.weight.clone().detach()
-        assert self.tp_sharded_weight is not None, "sharded weight should be clone before prefetch"
+    def prefetch_next_layer_full_weight(self, curr_layer_idx: int, comm_group:GroupCoordinator, async_op: bool = True):
+        # prefetch full weight for next layer
+        prefetch_layer_idx = (curr_layer_idx+1) % len(self.layer_idx_to_state)
+        state = self.layer_idx_to_state[prefetch_layer_idx]
+        assert state.tp_sharded_weight is not None, "sharded weight should be clone before prefetch"
         if comm_group.world_size == 1:
-            self.full_weight = self.tp_sharded_weight
-            self.gather_work = None
+            state.full_weight = state.tp_sharded_weight
+            state.gather_work = None
             return
 
-        assert self.full_weight is None, "Previous full_weight not cleaned up"
-        self.full_weight, self.gather_work = all_gather_async_for_sharded_linear(
-            input_=self.tp_sharded_weight,
+        assert state.full_weight is None, "Previous full_weight not cleaned up"
+        state.full_weight, state.gather_work = all_gather_async_for_sharded_linear(
+            input_=state.tp_sharded_weight,
             comm_group=comm_group,
             dim=self.gather_dim,
-            async_op=True
+            async_op=async_op
         )
         
-    def _sync_and_reshape_full_weight(self):
+    def _sync_and_reshape_full_weight(self, layer_idx: int):
         """Wait for async gather and reshape into original full tensor layout."""
-        if self.gather_work is not None:
-            self.gather_work.wait()
-            self.gather_work = None
+        state = self.layer_idx_to_state[layer_idx]
+        if state.gather_work is not None:
+            state.gather_work.wait()
+            state.gather_work = None
 
-        assert self.full_weight is not None, "Full weight not gathered"
+        assert state.full_weight is not None, "Full weight not gathered"
+        
         if self.tp_size > 1:
-            input_tensor = self.tp_sharded_weight
+            input_tensor = state.tp_sharded_weight
             dim = self.gather_dim % input_tensor.dim()  # normalize negative index
 
             # Reshape from flat gathered tensor back to logical full shape
             shard_size = input_tensor.size(dim)
             full_size = self.tp_size * shard_size
 
-            reshaped = self.full_weight.view((self.tp_size,) + input_tensor.shape)
+            reshaped = state.full_weight.view((self.tp_size,) + input_tensor.shape)
             reshaped = reshaped.movedim(0, dim)
-            self.full_weight = reshaped.reshape(
+            state.full_weight = reshaped.reshape(
                 input_tensor.shape[:dim] + (full_size,) + input_tensor.shape[dim + 1:]
             )
 
 
     def _create_full_weight_wrapped_forward(self, linear: LinearBase):
         def forward_with_full_weight(*args, **kwargs):
-            self._sync_and_reshape_full_weight()
+            layer_idx = extract_layer_index(linear.prefix)
+            state = self.layer_idx_to_state[layer_idx]
+            self._sync_and_reshape_full_weight(layer_idx)
             # Temporarily replace sharded weight with full version
-            assert self.full_weight is not None, f"Full weight not reconstructed for layer {linear.prefix}"
-            linear.weight.set_(self.full_weight)
+            assert state.full_weight is not None, f"Full weight not reconstructed for layer {linear.prefix}"
+            linear.weight.set_(state.full_weight)
             result = linear._original_forward(*args, **kwargs)
             # Restore original sharded weight
-            linear.weight.set_(self.tp_sharded_weight)
+            linear.weight.set_(state.tp_sharded_weight)
             # Clean up full weight to avoid memory leak
-            dispose_tensor(self.full_weight)
-            self.full_weight = None
+            dispose_tensor(state.full_weight)
+            state.full_weight = None
             return result
-        return forward_with_full_weight
-               
         
-
-
-
-
-
-
+        return forward_with_full_weight
 
 
 def all_gather_async_for_sharded_linear(input_: torch.Tensor,
