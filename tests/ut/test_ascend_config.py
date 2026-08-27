@@ -433,7 +433,6 @@ class TestAscendConfig(TestBase):
             os.environ,
             {
                 "VLLM_ASCEND_ENABLE_MLAPO": "0",
-                "VLLM_ASCEND_FUSION_OP_TRANSPOSE_KV_CACHE_BY_BLOCK": "0",
                 "VLLM_ASCEND_ENABLE_NZ": "2",
             },
         ):
@@ -441,7 +440,7 @@ class TestAscendConfig(TestBase):
 
         self.assertEqual(ascend_config.enable_fused_mc2, 0)
         self.assertFalse(ascend_config.enable_mlapo)
-        self.assertFalse(ascend_config.enable_transpose_kv_cache_by_block)
+        self.assertTrue(ascend_config.enable_transpose_kv_cache_by_block)
         self.assertEqual(ascend_config.weight_nz_mode, 2)
         mock_info_once.assert_any_call(
             "AscendConfig.enable_mlapo falls back to environment variable VLLM_ASCEND_ENABLE_MLAPO with value False. "
@@ -485,7 +484,6 @@ class TestAscendConfig(TestBase):
             os.environ,
             {
                 "VLLM_ASCEND_ENABLE_MLAPO": "0",
-                "VLLM_ASCEND_FUSION_OP_TRANSPOSE_KV_CACHE_BY_BLOCK": "0",
                 "VLLM_ASCEND_ENABLE_NZ": "2",
             },
         ):
