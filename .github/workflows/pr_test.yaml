@@ -532,7 +532,6 @@ jobs:
       matrix:
         vllm_version:
           - ${{ needs.pre-commit.outputs.main_commit }}
-          - ${{ needs.pre-commit.outputs.release_tag }}
     uses: ./.github/workflows/_selected_tests.yaml
     with:
       vllm: ${{ matrix.vllm_version }}
@@ -560,7 +559,6 @@ jobs:
       matrix:
         vllm_version:
           - ${{ needs.pre-commit.outputs.main_commit }}
-          - ${{ needs.pre-commit.outputs.release_tag }}
     uses: ./.github/workflows/_selected_tests_upstream.yaml
     with:
       vllm: ${{ matrix.vllm_version }}
@@ -585,7 +583,6 @@ jobs:
       matrix:
         vllm_version:
           - ${{ needs.pre-commit.outputs.main_commit }}
-          - ${{ needs.pre-commit.outputs.release_tag }}
     uses: ./.github/workflows/_selected_tests.yaml
     with:
       vllm: ${{ matrix.vllm_version }}
