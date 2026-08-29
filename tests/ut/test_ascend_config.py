@@ -42,7 +42,9 @@ from vllm_ascend.ascend_config import (
     get_ascend_config,
     init_ascend_config,
 )
-from vllm_ascend.utils import AscendDeviceType, clear_enable_sp, enable_dsa_cp, enable_sp, shared_expert_dp_enabled
+from vllm_ascend.device.hardware import AscendDeviceType
+from vllm_ascend.device.hardware_profile import get_hardware_profile
+from vllm_ascend.utils import clear_enable_sp, enable_dsa_cp, enable_sp, shared_expert_dp_enabled
 
 
 def test_config_modules_do_not_load_vllm_config():
@@ -400,7 +402,10 @@ class TestAscendConfig(TestBase):
 
     @_clean_up_ascend_config
     @patch("vllm_ascend.ascend_config.logger.warning")
-    @patch("vllm_ascend.utils.is_310p", return_value=True)
+    @patch(
+        "vllm_ascend.device.hardware_profile.get_current_hardware_profile",
+        return_value=get_hardware_profile(AscendDeviceType._310P),
+    )
     @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
     def test_init_ascend_config_disable_npugraph_ex_on_310p(
         self, mock_fix_incompatible_config, mock_is_310p, mock_warning
@@ -416,9 +421,9 @@ class TestAscendConfig(TestBase):
         self.assertFalse(ascend_compilation_config.enable_npugraph_ex)
         self.assertFalse(ascend_compilation_config.enable_static_kernel)
         warning_messages = [call.args[0] for call in mock_warning.call_args_list]
-        self.assertIn("npugraph_ex is not supported on Ascend 310P. Disabling it.", warning_messages)
+        self.assertIn("npugraph_ex is not supported by the current hardware profile. Disabling it.", warning_messages)
         self.assertIn(
-            "static kernel requires npugraph_ex, which is not supported on Ascend 310P. Disabling it.",
+            "static kernel requires npugraph_ex, which is not supported by the current hardware profile. Disabling it.",
             warning_messages,
         )
 
@@ -916,8 +921,11 @@ class TestUpstreamConfigCompatibility(TestBase):
         self.assertTrue(AscendConfig._is_megamoe_supported_by_config(supported))
         self.assertFalse(AscendConfig._is_megamoe_supported_by_config(unsupported))
 
-    @patch("vllm_ascend.utils.get_ascend_device_type", return_value=AscendDeviceType.A2)
-    def test_mc2_hierarchy_comm_rejects_more_than_512_experts(self, mock_device_type):
+    @patch(
+        "vllm_ascend.device.hardware_profile.get_current_hardware_profile",
+        return_value=get_hardware_profile(AscendDeviceType.A2),
+    )
+    def test_mc2_hierarchy_comm_rejects_more_than_512_experts(self, _mock_profile):
         config = AscendConfig(
             sparse_kv_offload_config=SimpleNamespace(enabled=False),
             mc2_comm_alg="hierarchy",
@@ -927,16 +935,44 @@ class TestUpstreamConfigCompatibility(TestBase):
         with self.assertRaisesRegex(ValueError, "supports at most 512 experts"):
             config._validate_mc2_comm_alg(vllm_config)
 
-    @patch("vllm_ascend.utils.get_ascend_device_type", return_value=AscendDeviceType.A5)
-    def test_mc2_hierarchy_comm_rejects_unsupported_device(self, mock_device_type):
+    @patch(
+        "vllm_ascend.device.hardware_profile.get_current_hardware_profile",
+        return_value=get_hardware_profile(AscendDeviceType.A5),
+    )
+    def test_mc2_hierarchy_comm_rejects_unsupported_device(self, _mock_profile):
         config = AscendConfig(
             sparse_kv_offload_config=SimpleNamespace(enabled=False),
             mc2_comm_alg="hierarchy",
         )
         vllm_config = SimpleNamespace(model_config=SimpleNamespace(get_num_experts=lambda: 1))
 
-        with self.assertRaisesRegex(NotImplementedError, "only supported on A2 and A3"):
+        with self.assertRaisesRegex(NotImplementedError, "not supported by the current hardware profile"):
             config._validate_mc2_comm_alg(vllm_config)
+
+    @patch(
+        "vllm_ascend.device.hardware_profile.get_current_hardware_profile",
+        return_value=get_hardware_profile(AscendDeviceType.A5),
+    )
+    def test_mc2_fullmesh_v2_rejects_unsupported_device(self, _mock_profile):
+        config = AscendConfig(
+            sparse_kv_offload_config=SimpleNamespace(enabled=False),
+            mc2_comm_alg="fullmesh_v2",
+        )
+
+        with self.assertRaisesRegex(NotImplementedError, "not supported by the current hardware profile"):
+            config._validate_mc2_comm_alg(SimpleNamespace())
+
+    @patch(
+        "vllm_ascend.device.hardware_profile.get_current_hardware_profile",
+        return_value=get_hardware_profile(AscendDeviceType.A3),
+    )
+    def test_mc2_fullmesh_uses_a3_operator_alias(self, _mock_profile):
+        config = AscendConfig(
+            sparse_kv_offload_config=SimpleNamespace(enabled=False),
+            mc2_comm_alg="fullmesh",
+        )
+
+        self.assertEqual(config.get_mc2_comm_alg(), "fullmesh_v1")
 
 
 class TestTopLevelSwitchTypeValidation(TestBase):

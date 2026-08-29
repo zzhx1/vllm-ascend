@@ -46,9 +46,10 @@ def validate_additional_config_bool(value: Any, path: str) -> bool:
 class AscendCompilationConfig:
     """Configuration for controlling the behavior of Ascend graph optimization.
 
-    Migrated to ``@config`` (pydantic dataclass). The 310P runtime downgrade
-    (disable npugraph_ex / static_kernel) and the static_kernel→npugraph_ex
-    dependency check are applied in an ``after`` model_validator.
+    Migrated to ``@config`` (pydantic dataclass). Hardware-profile runtime
+    downgrades (disable npugraph_ex / static_kernel) and the
+    static_kernel→npugraph_ex dependency check are applied in an ``after``
+    model_validator.
     """
 
     enable_npugraph_ex: bool = True
@@ -58,15 +59,16 @@ class AscendCompilationConfig:
     fuse_muls_add: bool = True
 
     @model_validator(mode="after")
-    def _apply_310p_downgrade_and_static_kernel_check(self):
-        from vllm_ascend.utils import is_310p
+    def _apply_unsupported_hardware_downgrade_and_static_kernel_check(self):
+        from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 
-        if is_310p():
+        if not get_current_hardware_profile().supports(HardwareCapability.NPUGRAPH_EX):
             if self.enable_npugraph_ex:
-                logger.warning("npugraph_ex is not supported on Ascend 310P. Disabling it.")
+                logger.warning("npugraph_ex is not supported by the current hardware profile. Disabling it.")
             if self.enable_static_kernel:
                 logger.warning(
-                    "static kernel requires npugraph_ex, which is not supported on Ascend 310P. Disabling it."
+                    "static kernel requires npugraph_ex, which is not supported by the current hardware profile. "
+                    "Disabling it."
                 )
             self.enable_npugraph_ex = False
             self.enable_static_kernel = False
@@ -533,22 +535,19 @@ class AscendConfig:
         return self
 
     def _validate_mc2_comm_alg(self, vllm_config: VllmConfig) -> None:
-        from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
+        from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 
-        device_type = get_ascend_device_type()
-
-        if self.mc2_comm_alg == "fullmesh_v2" and device_type != AscendDeviceType.A3:
-            raise NotImplementedError(
-                f"mc2_comm_alg == 'fullmesh_v2' is only supported on A3, but got {device_type.name}."
-            )
+        hardware_profile = get_current_hardware_profile()
+        if self.mc2_comm_alg == "fullmesh_v2" and not hardware_profile.supports(
+            HardwareCapability.MC2_FULLMESH_V2_COMM
+        ):
+            raise NotImplementedError("mc2_comm_alg == 'fullmesh_v2' is not supported by the current hardware profile.")
 
         if self.mc2_comm_alg != "hierarchy":
             return
 
-        if device_type not in (AscendDeviceType.A2, AscendDeviceType.A3):
-            raise NotImplementedError(
-                f"mc2_comm_alg == 'hierarchy' is only supported on A2 and A3, but got {device_type.name}."
-            )
+        if not hardware_profile.supports(HardwareCapability.MC2_HIERARCHY_COMM):
+            raise NotImplementedError("mc2_comm_alg == 'hierarchy' is not supported by the current hardware profile.")
 
         num_logical_experts = vllm_config.model_config.get_num_experts()
         num_redundant_experts = self.eplb_config.num_redundant_experts if self.eplb_config.dynamic_eplb else 0
@@ -731,11 +730,13 @@ class AscendConfig:
         return
 
     def get_mc2_comm_alg(self) -> str:
-        from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
+        from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 
         # When A3 and comm_alg == "fullmesh", dispatch/combine op need pass in "fullmesh_v1" instead of "fullmesh"
         # TODO(zzzzwwjj): Remove it when op's param is uniformed between A2/A3/A5.
-        if self.mc2_comm_alg == "fullmesh" and get_ascend_device_type() == AscendDeviceType.A3:
+        if self.mc2_comm_alg == "fullmesh" and get_current_hardware_profile().supports(
+            HardwareCapability.MC2_FULLMESH_V2_COMM
+        ):
             return "fullmesh_v1"
         return self.mc2_comm_alg
 
