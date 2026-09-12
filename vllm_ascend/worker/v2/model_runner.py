@@ -153,7 +153,7 @@ class NPUModelRunner(GPUModelRunner):
             vocab_size=self.vocab_size,
             device=self.device,
         )
-        if self.use_spec_pp:
+        if self.use_spec_pp and vllm_version_is("0.28.0"):
             from vllm_ascend.patch.worker.patch_v2.patch_spec_pp import (
                 install_spec_pp_token_broadcast,
             )
@@ -234,10 +234,8 @@ class NPUModelRunner(GPUModelRunner):
 
         self._restore_replicated_draft_target_states()
         output = super().sample_tokens(grammar_output)
-
-        if self.use_spec_pp and self.is_last_pp_rank:
+        if vllm_version_is("0.28.0") and self.use_spec_pp and self.is_last_pp_rank:
             assert self.pp_handler is not None
-            # Wait until propose() has populated this step's draft tokens.
             self.pp_handler.broadcast_draft_tokens()
         return output
 
@@ -269,6 +267,7 @@ class NPUModelRunner(GPUModelRunner):
         skip_attn_for_dummy_run: bool = False,
         is_profile: bool = False,
         context_len: int = 0,
+        valid_dummy_state_slots: bool = False,
     ):
         self._cpp_execution_time_ms = None
         profiling_config = self.ascend_config.scheduler_config.profiling_chunk_config
@@ -285,6 +284,7 @@ class NPUModelRunner(GPUModelRunner):
             skip_attn_for_dummy_run=skip_attn_for_dummy_run,
             is_profile=is_profile,
             context_len=context_len,
+            **({} if vllm_version_is("0.28.0") else {"valid_dummy_state_slots": valid_dummy_state_slots}),
         )
         self.model_state.kvpp_is_dummy_run = False
         self.kvpp.complete_forward()
@@ -479,11 +479,6 @@ class NPUModelRunner(GPUModelRunner):
         )
         seq_lens_cpu_upper_bound = torch.from_numpy(seq_lens_cpu_upper_bound_np)
 
-        max_seq_len_np = None
-        if self.use_pp:
-            # max_seq_len is only consumed by the PP `compute_need_sampled_mask`
-            max_seq_len_np = self.req_states.max_seq_len[idx_mapping_np]
-
         prompt_lens = None
         if self.model_config.rswa_window is not None:
             # prompt_lens is only used in R-SWA case.
@@ -512,7 +507,11 @@ class NPUModelRunner(GPUModelRunner):
             num_computed_prefill_tokens_np=batch_req_state.num_computed_prefill_tokens_np,
             is_prefilling_np=batch_req_state.is_prefilling_np,
             has_prefill=batch_req_state.has_prefill,
-            max_seq_len_np=max_seq_len_np,
+            **(
+                {"max_seq_len_np": self.req_states.max_seq_len[idx_mapping_np] if self.use_pp else None}
+                if vllm_version_is("0.28.0")
+                else {}
+            ),
             input_ids=self.input_buffers.input_ids[:num_tokens_after_padding],
             positions=self.input_buffers.positions[:num_tokens_after_padding],
             is_padding=self.input_buffers.is_padding[:num_tokens_after_padding],
@@ -546,10 +545,21 @@ class NPUModelRunner(GPUModelRunner):
 
         return input_batch
 
-    def prepare_dummy_attn(self, input_batch: AscendInputBatch) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
+    def prepare_dummy_attn(
+        self, input_batch: AscendInputBatch, valid_state_slots: bool = False
+    ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
         if self.pcp_manager is None:
-            return super().prepare_dummy_attn(input_batch)
-        return self.pcp_manager.prepare_dummy_attn(input_batch)
+            return super().prepare_dummy_attn(
+                input_batch,
+                **({} if vllm_version_is("0.28.0") else {"valid_state_slots": valid_state_slots}),
+            )
+        block_tables, slot_mappings = self.pcp_manager.prepare_dummy_attn(input_batch)
+        if not vllm_version_is("0.28.0") and valid_state_slots:
+            # Match the upstream state-slot contract in the persistent PCP views.
+            for block_table in block_tables:
+                state_slots = torch.arange(1, block_table.shape[0] + 1, dtype=torch.int32, device=block_table.device)
+                block_table[:, 0].copy_(state_slots)
+        return block_tables, slot_mappings
 
     def _lmhead_tp_max_num_logits(self) -> int:
         """Logits row capacity shared by every rank of the lmhead-TP group.
