@@ -32,7 +32,6 @@ from vllm_ascend.attention.utils import (
     get_sfa_qsfa_packed_head_dim,
     maybe_save_kv_layer_to_connector,
     notify_kv_cache_written,
-    scatter_paged_cache,
     trans_rope_weight,
     transdata,
     wait_for_kv_layer_from_connector,
@@ -1080,7 +1079,12 @@ class AscendSFAImpl(MLAAttentionImpl):
             assert self.kv_a_layernorm is not None
             values = self.kv_a_layernorm(kv_no_split.reshape(-1, self.kv_lora_rank))
             cache = kv_cache[0]
-            scatter_paged_cache(cache, slots[: values.shape[0]].long(), values.to(cache.dtype), cache.shape[1])
+            # The hybrid cache configuration keeps NoPE main KV pages packed.
+            torch_npu.npu_scatter_nd_update_(
+                cache.view(-1, self.kv_lora_rank),
+                slots[: values.shape[0]].view(-1, 1),
+                values.to(cache.dtype),
+            )
             return None, None
         B = kv_no_split.shape[0]
         N = self.num_kv_heads
