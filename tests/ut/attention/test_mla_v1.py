@@ -63,6 +63,7 @@ def test_mxfp8_mla_fused_preprocess_owns_nz_conversion(
     config = SimpleNamespace(
         model_config=SimpleNamespace(runner_type="draft" if is_draft else "generate", dtype=torch.bfloat16),
         parallel_config=SimpleNamespace(prefill_context_parallel_size=1),
+        cache_config=SimpleNamespace(cache_dtype="float16"),
         speculative_config=None,
     )
     with (
@@ -1496,6 +1497,8 @@ class TestAscendMLAImpl(TestBase):
         get_current_vllm_config.return_value = vllm_config
         vllm_config.additional_config = {"refresh": True}
         vllm_config.parallel_config = parallel_config
+        vllm_config.cache_config = MagicMock()
+        vllm_config.cache_config.cache_dtype = "float16"
         init_ascend_config(vllm_config)
 
         num_heads = 256
@@ -1609,6 +1612,7 @@ class TestAscendMLAImpl(TestBase):
         """Test head padding computation for num_heads that are not power of 2 (e.g. GLM-4.7-Flash with 20 heads)."""
         mock_get_current_vllm_config.return_value = MagicMock()
         mock_get_current_vllm_config.return_value.parallel_config.prefill_context_parallel_size = 1
+        mock_get_current_vllm_config.return_value.cache_config.cache_dtype = "float16"
         kwargs = {
             "kv_lora_rank": 32,
             "qk_nope_head_dim": 64,
@@ -2057,6 +2061,7 @@ class TestAscendMLAImpl(TestBase):
         """Test prefill with non-power-of-2 heads uses concat instead of query_rope/key_rope kwargs."""
         mock_get_current_vllm_config.return_value = MagicMock()
         mock_get_current_vllm_config.return_value.parallel_config.prefill_context_parallel_size = 1
+        mock_get_current_vllm_config.return_value.cache_config.cache_dtype = "float16"
         num_heads = 20
         kwargs = {
             "kv_lora_rank": 32,
@@ -2403,6 +2408,7 @@ class TestAscendMLAImpl(TestBase):
         """Test prefill context with non-power-of-2 heads uses concat for query and key."""
         mock_get_current_vllm_config.return_value = MagicMock()
         mock_get_current_vllm_config.return_value.parallel_config.prefill_context_parallel_size = 1
+        mock_get_current_vllm_config.return_value.cache_config.cache_dtype = "float16"
         num_heads = 20
         kwargs = {
             "kv_lora_rank": 32,
@@ -2830,6 +2836,7 @@ class TestAscendMLAImpl(TestBase):
         """Test decode with non-power-of-2 heads pads to next power of 2 and slices output."""
         mock_get_current_vllm_config.return_value = MagicMock()
         mock_get_current_vllm_config.return_value.parallel_config.prefill_context_parallel_size = 1
+        mock_get_current_vllm_config.return_value.cache_config.cache_dtype = "float16"
         num_heads = 20
         kwargs = {
             "kv_lora_rank": 256,
@@ -2916,6 +2923,7 @@ class TestAscendMLAImpl(TestBase):
         """Test normal decode (BNSD_NBSD) with non-power-of-2 heads pads q and slices output."""
         mock_get_current_vllm_config.return_value = MagicMock()
         mock_get_current_vllm_config.return_value.parallel_config.prefill_context_parallel_size = 1
+        mock_get_current_vllm_config.return_value.cache_config.cache_dtype = "float16"
         num_heads = 20
         kwargs = {
             "kv_lora_rank": 256,
