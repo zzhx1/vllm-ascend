@@ -15,7 +15,7 @@ from vllm.v1.kv_cache_interface import (
 
 from tests.ut.base import TestBase
 from vllm_ascend.device.hardware import AscendDeviceType
-from vllm_ascend.device.hardware_profile import get_hardware_profile
+from vllm_ascend.device.hardware_profile import HardwareCapability, get_hardware_profile
 
 init_cached_hf_modules_path = "vllm.utils.import_utils.init_cached_hf_modules"
 kw_module = importlib.import_module("vllm_ascend.model_executor.warmup.kernel_warmup")
@@ -660,7 +660,11 @@ class TestNPUWorker(TestBase):
 
         # Setup mock
         mock_mem_get_info.return_value = (1000, 2000)
-        mock_get_device_type.return_value = get_hardware_profile(AscendDeviceType.A2)
+        profile = get_hardware_profile(AscendDeviceType.A2)
+        mock_get_device_type.return_value = MagicMock(wraps=profile)
+        mock_get_device_type.return_value.supports.side_effect = (
+            lambda capability: capability == HardwareCapability.LOCAL_KV_COMM_RESOURCE or profile.supports(capability)
+        )
 
         # Mock MemorySnapshot
         mock_snapshot = MagicMock()
@@ -668,8 +672,9 @@ class TestNPUWorker(TestBase):
         mock_snapshot.total_memory = 2000
         mock_snapshot_cls.return_value = mock_snapshot
 
-        # Mock current_platform for v0.24.0 init_device path
-        mock_current_platform.logical_device_id_to_visible_device_id.return_value = 0
+        # Make the bound visible NPU differ from local_rank to verify that
+        # local communication setup follows the actual device binding.
+        mock_current_platform.logical_device_id_to_visible_device_id.return_value = 1
         mock_current_platform.device_type = "npu"
 
         # Create worker mock
@@ -689,10 +694,16 @@ class TestNPUWorker(TestBase):
             worker.cache_config.gpu_memory_utilization = 0.5
 
             # Test _init_device
-            result = worker._init_device()
+            with patch("vllm_ascend.worker.worker.setup_ascend_local_comm_res") as setup_endpoint:
+                result = worker._init_device()
+
+            # Both calls must use the mapped visible ordinal, not local_rank.
+            mock_set_device.assert_called_once_with(torch.device("npu:1"))
+            setup_endpoint.assert_called_once_with(1, worker.vllm_config.kv_transfer_config)
+            self.assertEqual(worker.local_rank, 0)
 
             mock_init_dist_env.assert_called_once()
-            self.assertEqual(str(result), "npu:0")
+            self.assertEqual(str(result), "npu:1")
             self.assertEqual(worker.init_snapshot, mock_snapshot)
             self.assertEqual(worker.requested_memory, 2000 * 0.5)
 
