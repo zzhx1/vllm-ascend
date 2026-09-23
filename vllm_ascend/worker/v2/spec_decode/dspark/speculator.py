@@ -15,14 +15,17 @@
 # limitations under the License.
 # This file is a part of the vllm-ascend project.
 #
+from collections.abc import Mapping
 from typing import Any, cast
 
+import numpy as np
 import torch
 from vllm.config import VllmConfig, get_layers_from_vllm_config, set_current_vllm_config
 from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed import get_dcp_group
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.v1.attention.backend import AttentionBackend
+from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.spec_decode.dspark.speculator import (
     DSparkSpeculator,
@@ -164,34 +167,73 @@ class AscendDSparkSpeculator(DSparkSpeculator):
                 parallel_config=self.attn_vllm_config.parallel_config,
             ),
         ):
-            attn_metadata = super()._build_draft_attn_metadata(
+            # vLLM main (#56181) replaced _build_draft_attn_metadata with
+            # _build_uniform_attn_metadata (BatchExecutionDescriptor).
+            batch_desc = BatchExecutionDescriptor(
+                cg_mode=CUDAGraphMode.FULL,
+                num_tokens=num_tokens_padded,
+                num_reqs=num_reqs_padded,
+            )
+            attn_metadata = self._build_uniform_attn_metadata(
                 num_reqs=self.input_batch.num_reqs,
-                num_reqs_padded=num_reqs_padded,
-                num_tokens_padded=num_tokens_padded,
+                batch_desc=batch_desc,
+                num_query_per_req=self.num_query_per_req,
                 seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
                 step=self.num_query_per_req,
                 causal=self._group_causal,
             )
 
-        if self.attn_architecture not in ("GQA", "MLA"):
-            return [attn_metadata]
+        return [attn_metadata]
 
-        return [self._update_draft_attn_metadata(attn_metadata, num_reqs_padded)]
+    def _build_draft_attn_metadata(  # type: ignore[misc]
+        self,
+        *,
+        num_reqs: int,
+        num_reqs_padded: int,
+        num_tokens_padded: int,
+        seq_lens_cpu_upper_bound: torch.Tensor,
+        step: int,
+        causal: bool | Mapping[int, bool] = True,
+        query_start_loc_np: np.ndarray | None = None,
+        dcp_local_seq_lens: torch.Tensor | None = None,
+    ) -> dict[str, Any] | None:
+        """Backward-compatible entry point for the pre-#56181 hook name.
 
-    def _build_draft_attn_metadata(self, *, num_reqs_padded, **kwargs):
-        if self.attn_architecture not in ("GQA", "MLA"):
-            return super()._build_draft_attn_metadata(num_reqs_padded=num_reqs_padded, **kwargs)
-
-        # This kwargs["num_tokens_padded"] is only useful in eager/PIECEWISE.
-        # TODO: Replace this temporary padding workaround with upstream #56181's
-        # actual-token metadata and MLA input slicing for non-FULL execution.
-        num_tokens_padded = kwargs["num_tokens_padded"]
-        assert num_tokens_padded % self.num_query_per_req == 0, "Draft tokens must contain whole query groups"
-        num_reqs_padded = num_tokens_padded // self.num_query_per_req
-
-        seq_lens_cpu, is_prefilling = self._prepare_draft_dcp_metadata_inputs(
-            kwargs["num_reqs"], num_reqs_padded, kwargs["step"]
+        vLLM main renamed ``_build_draft_attn_metadata`` into
+        ``_build_uniform_attn_metadata`` / ``_build_attn_metadata``. The Ascend
+        graph manager and the unit tests still call the legacy name, so forward
+        it to the new hooks while preserving the SFA pass-through and the
+        Ascend draft metadata factory context.
+        """
+        batch_desc = BatchExecutionDescriptor(
+            cg_mode=CUDAGraphMode.FULL,
+            num_tokens=num_tokens_padded,
+            num_reqs=num_reqs_padded,
         )
+        if self.attn_architecture not in ("GQA", "MLA"):
+            # Non-MLA/GQA (e.g. SFA) delegates straight to upstream without
+            # Ascend CPU-side DCP preparation.
+            if query_start_loc_np is not None:
+                return super()._build_attn_metadata(
+                    num_reqs=num_reqs,
+                    batch_desc=batch_desc,
+                    query_start_loc_np=query_start_loc_np,
+                    seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
+                    step=step,
+                    causal=causal,
+                    dcp_local_seq_lens=dcp_local_seq_lens,
+                )
+            return super()._build_uniform_attn_metadata(
+                batch_desc=batch_desc,
+                num_reqs=num_reqs,
+                num_query_per_req=self.num_query_per_req,
+                seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
+                step=step,
+                causal=causal,
+                dcp_local_seq_lens=dcp_local_seq_lens,
+            )
+
+        seq_lens_cpu, is_prefilling = self._prepare_draft_dcp_metadata_inputs(num_reqs, num_reqs_padded, step)
         with (
             build_attn_metadata_wrapper(),
             build_draft_attn_metadata_factory(
@@ -203,23 +245,67 @@ class AscendDSparkSpeculator(DSparkSpeculator):
                 parallel_config=self.attn_vllm_config.parallel_config,
             ),
         ):
-            attn_metadata = super()._build_draft_attn_metadata(num_reqs_padded=num_reqs_padded, **kwargs)
+            if query_start_loc_np is not None:
+                attn_metadata = self._build_attn_metadata(
+                    num_reqs=num_reqs,
+                    batch_desc=batch_desc,
+                    query_start_loc_np=query_start_loc_np,
+                    seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
+                    step=step,
+                    causal=causal,
+                    dcp_local_seq_lens=dcp_local_seq_lens,
+                )
+            else:
+                attn_metadata = self._build_uniform_attn_metadata(
+                    num_reqs=num_reqs,
+                    batch_desc=batch_desc,
+                    num_query_per_req=self.num_query_per_req,
+                    seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
+                    step=step,
+                    causal=causal,
+                    dcp_local_seq_lens=dcp_local_seq_lens,
+                )
         return self._update_draft_attn_metadata(attn_metadata, num_reqs_padded)
+
+    def _build_uniform_attn_metadata(  # type: ignore[misc]
+        self,
+        batch_desc: BatchExecutionDescriptor,
+        num_reqs: int,
+        num_query_per_req: int,
+        seq_lens_cpu_upper_bound: torch.Tensor,
+        step: int,
+        causal: bool | Mapping[int, bool] = True,
+        dcp_local_seq_lens: torch.Tensor | None = None,
+    ) -> dict[str, Any] | None:
+        """Extend vLLM's uniform draft metadata builder for padded batches.
+
+        DSpark inherits DFlash's full-graph path, and upstream
+        ``Speculator._build_uniform_attn_metadata`` clamps ``query_start_loc``
+        at the real ``num_reqs`` to keep the cumulative series non-decreasing,
+        so when a batch is padded to a capture size the cumulative query
+        lengths stop at ``num_reqs * num_query_per_req`` instead of
+        ``num_tokens_padded``. The Ascend FIA operator requires, in TND layout,
+        that the last element of ``actual_seq_lengths_q`` equals the query
+        token count of the graph being replayed; otherwise tiling fails with
+        ``queryT != last element of actualSequenceLengthQ``. Rebuild the
+        per-layer lengths from the padded request count here.
+        """
+        attn_metadata = super()._build_uniform_attn_metadata(
+            batch_desc=batch_desc,
+            num_reqs=num_reqs,
+            num_query_per_req=num_query_per_req,
+            seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
+            step=step,
+            causal=causal,
+            dcp_local_seq_lens=dcp_local_seq_lens,
+        )
+        if self.attn_architecture not in ("GQA", "MLA"):
+            return attn_metadata
+        return self._update_draft_attn_metadata(attn_metadata, batch_desc.num_reqs or num_reqs)
 
     def _update_draft_attn_metadata(self, attn_metadata, num_reqs_padded):
         """Rebuild ``actual_seq_lengths_q`` from the padded request count,
         mirroring Eagle's ``_update_decode_attn_metadata``.
-
-        DSpark inherits DFlash's full-graph path, and upstream
-        ``Speculator._build_draft_attn_metadata`` clamps ``query_start_loc`` at
-        the real ``num_reqs`` to keep the cumulative series non-decreasing, so
-        when a batch is padded to a capture size (``num_reqs_padded >
-        num_reqs``) the cumulative query lengths stop at
-        ``num_reqs * num_query_per_req`` instead of ``num_tokens_padded``. The
-        Ascend FIA operator requires, in TND layout, that the last element of
-        ``actual_seq_lengths_q`` equals the query token count of the graph
-        being replayed; otherwise tiling fails with
-        ``queryT != last element of actualSequenceLengthQ``.
         """
         query_lens_list = [(i + 1) * self.num_query_per_req for i in range(num_reqs_padded)]
         for metadata in attn_metadata.values():

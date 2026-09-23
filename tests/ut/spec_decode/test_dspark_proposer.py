@@ -38,7 +38,6 @@ from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec, AscendSFAIndexerCacheSpec
 from vllm_ascend.spec_decode.dspark_proposer import AscendDSparkProposer
 from vllm_ascend.spec_decode.llm_base_proposer import AscendSpecDecodeBaseProposer
-from vllm_ascend.utils import vllm_version_is
 from vllm_ascend.worker.dcp_utils import DCPManager
 from vllm_ascend.worker.device_metadata import DeviceMetadataStage, DeviceMetadataTask
 
@@ -909,7 +908,6 @@ class TestInitializeAttnBackend(_DSparkProposerTestBase):
         proposer._per_group_slot_mappings = {}
         return proposer
 
-    @pytest.mark.skipif(vllm_version_is("0.29.0"), reason="DeepSeek V4.1 is unavailable on vLLM 0.29")
     def test_deepseek_v41_draft_uses_only_group_twelve(self, monkeypatch):
         from tests.deepseek_v41_utils import make_cache_config
 

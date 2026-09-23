@@ -25,6 +25,39 @@ def _local(lengths, rank=1, size=8, interleave=4):
     )
 
 
+def _dcp_local_cpu(common):
+    """CPU DCP-local lengths under either the Ascend or upstream field name.
+
+    Ascend's ``AscendCommonAttentionMetadata`` keeps ``dcp_local_seq_lens_cpu``;
+    vLLM main (#56157) renamed the upstream field to
+    ``dcp_local_seq_lens_cpu_upper_bound``. The direct SFA pass-through receives
+    the upstream metadata, so both spellings must be tolerated.
+    """
+    if hasattr(common, "dcp_local_seq_lens_cpu"):
+        return common.dcp_local_seq_lens_cpu
+    return getattr(common, "dcp_local_seq_lens_cpu_upper_bound", None)
+
+
+class FakeDecodeMetadata:
+    """Minimal stand-in mirroring ``AscendMLADCPDecodeMetadata``."""
+
+    def __init__(self, actual_seq_lengths_q):
+        self.actual_seq_lengths_q = actual_seq_lengths_q
+        self.seq_lens_list = None
+
+    def update_dcp_seq_lens_cpu(
+        self,
+        seq_lens_cpu,
+        dcp_local_seq_lens_cpu,
+        query_lens_cpu,
+        *,
+        dcp_size,
+        dcp_rank,
+        cp_kv_cache_interleave_size,
+    ):
+        self.cp_seq_len = dcp_local_seq_lens_cpu.tolist()
+
+
 def _speculator(monkeypatch, kind, architecture, width, padded, step, use_dcp=True):
     config = SimpleNamespace(
         attention_config=AttentionConfig(),
@@ -66,7 +99,10 @@ def _speculator(monkeypatch, kind, architecture, width, padded, step, use_dcp=Tr
         query_start_loc=torch.tensor([0, width, 2 * width, 2 * width, 2 * width], dtype=torch.int32),
         dcp_local_seq_lens=torch.zeros(4, dtype=torch.int32),
     )
-    spec.arange = torch.arange(5, dtype=torch.int32)
+    spec.arange_np = np.arange(5, dtype=np.int32)
+    # Upstream #56107 reads this in _build_attn_metadata; Ascend forces its own
+    # is_prefilling through the draft metadata factory, so the contents are unused.
+    spec.draft_is_prefilling = torch.zeros(4, dtype=torch.bool)
     spec.block_tables = SimpleNamespace(
         cp_size=8 if use_dcp else 1,
         cp_rank=1 if use_dcp else 0,
@@ -79,8 +115,16 @@ def _speculator(monkeypatch, kind, architecture, width, padded, step, use_dcp=Tr
     class RecordingBuilder:
         def build(self, common_prefix_len, common_attn_metadata):
             common = common_attn_metadata
-            decode = SimpleNamespace(actual_seq_lengths_q=common.query_start_loc_cpu[1:].tolist())
-            return SimpleNamespace(common=common, decode=decode, seq_lens_cpu=common.seq_lens_cpu)
+            decode = FakeDecodeMetadata(common.query_start_loc_cpu[1:].tolist())
+            # Keep the layer metadata's CPU view independent of the batch-level
+            # one, matching the real builder (see the "without_aliasing" case in
+            # test_mla_dcp_metadata_v2.py). vLLM main also dropped the deprecated
+            # CommonAttentionMetadata.seq_lens_cpu property, so fall back to the
+            # device lengths for the upstream pass-through.
+            seq_lens_cpu = getattr(common, "seq_lens_cpu", None)
+            if seq_lens_cpu is None:
+                seq_lens_cpu = common.seq_lens
+            return SimpleNamespace(common=common, decode=decode, seq_lens_cpu=seq_lens_cpu.clone())
 
     spec.attn_groups = [
         [SimpleNamespace(get_metadata_builder=lambda _: RecordingBuilder(), layer_names=["draft.layer"])]
@@ -121,10 +165,12 @@ def test_dspark_common_dcp_preparation(monkeypatch, architecture, padded, width,
         )
     common = result["draft.layer"].common
     if architecture == "SFA" and not full_rebuild:
-        # The direct SFA entry delegates to upstream without Ascend CPU preparation.
-        torch.testing.assert_close(common.seq_lens_cpu, device_lengths[:padded])
-        assert common.dcp_local_seq_lens_cpu is None
-        assert common.is_prefilling is None
+        # The direct SFA entry delegates to upstream without Ascend CPU
+        # preparation, so the CPU view is the device lengths and the upstream
+        # field names/values apply (upstream now forwards is_prefilling).
+        torch.testing.assert_close(common.seq_lens, device_lengths[:padded])
+        assert _dcp_local_cpu(common) is None
+        assert common.is_prefilling.tolist() == [False, False]
     else:
         expected = [31 + width, 128] + [0] * (padded - 2)
         assert common.seq_lens_cpu.tolist() == expected
@@ -183,11 +229,12 @@ def test_non_dcp_preserves_existing_length_fallback(monkeypatch, kind, architect
                 step=width,
             )
     common = result["draft.layer"].common
-    assert common.dcp_local_seq_lens_cpu is None
+    assert _dcp_local_cpu(common) is None
     assert common.dcp_local_seq_lens is None
     if kind == "dspark" and architecture == "SFA" and not full_rebuild:
-        # Upstream lazily derives its CPU view from device lengths.
-        torch.testing.assert_close(common.seq_lens_cpu, device_lengths[:2])
+        # Upstream derives its CPU view from the device lengths; the deprecated
+        # seq_lens_cpu property was removed in vLLM main.
+        torch.testing.assert_close(common.seq_lens, device_lengths[:2])
     else:
         assert common.seq_lens_cpu.tolist() == [128, 128]
     assert torch.equal(common.seq_lens, device_lengths[:2])
