@@ -20,6 +20,7 @@ from typing import Any, cast
 import torch
 from vllm.config import VllmConfig, get_layers_from_vllm_config, set_current_vllm_config
 from vllm.config.compilation import CUDAGraphMode
+from vllm.distributed import get_dcp_group
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.worker.gpu.input_batch import InputBatch
@@ -29,6 +30,7 @@ from vllm.v1.worker.gpu.spec_decode.dspark.speculator import (
 
 from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAttentionState
 from vllm_ascend.attention.mla_v1 import AscendMLABackend
+from vllm_ascend.worker.dcp_utils import DCPManager
 from vllm_ascend.worker.v2.aclgraph_utils import _get_graph_update_backend
 from vllm_ascend.worker.v2.attn_utils import (
     build_attn_metadata_wrapper,
@@ -45,6 +47,22 @@ class AscendDSparkSpeculator(DSparkSpeculator):
         super().__init__(vllm_config, device)
         self.input_batch: InputBatch | None = None
         self.attn_architecture: str | None = None
+        self._init_dcp()
+
+    def _init_dcp(self) -> None:
+        self.use_dcp = self.attn_vllm_config.parallel_config.decode_context_parallel_size > 1
+        self.dcp_manager: DCPManager | None = None
+        if not self.use_dcp:
+            return
+        self.dcp_manager = DCPManager(
+            dcp_world_size=self.attn_vllm_config.parallel_config.decode_context_parallel_size,
+            dcp_rank=get_dcp_group().rank_in_group,
+            max_buffer_num_tokens=self.max_num_tokens,
+            max_num_reqs=self.max_num_reqs,
+            device=self.device,
+            vllm_config=self.attn_vllm_config,
+            use_async_scheduling=self.vllm_config.scheduler_config.async_scheduling,
+        )
 
     def load_draft_model(
         self,
@@ -113,17 +131,37 @@ class AscendDSparkSpeculator(DSparkSpeculator):
             else:
                 self.attn_architecture = None
 
+    def _prepare_draft_dcp_metadata_inputs(
+        self, num_reqs: int, num_reqs_padded: int, step: int
+    ) -> tuple[torch.Tensor | None, torch.Tensor]:
+        is_prefilling = torch.zeros(num_reqs_padded, dtype=torch.bool)
+        if not self.use_dcp:
+            return None, is_prefilling
+        assert self.dcp_manager is not None
+        return self.dcp_manager.prepare_draft_dcp_metadata_inputs(
+            target_seq_lens_cpu=self.target_input_buffers.seq_lens_cpu,
+            is_prefilling=is_prefilling,
+            num_reqs=num_reqs,
+            num_reqs_padded=num_reqs_padded,
+            step=step,
+            max_model_len=self.max_model_len,
+        )
+
     def build_draft_attn_metadatas(self, num_reqs_padded, seq_lens_cpu_upper_bound):
         assert self.input_batch is not None
         num_tokens_padded = num_reqs_padded * self.num_query_per_req
-
+        seq_lens_cpu, is_prefilling = self._prepare_draft_dcp_metadata_inputs(
+            self.input_batch.num_reqs, num_reqs_padded, self.num_query_per_req
+        )
         with (
             build_attn_metadata_wrapper(),
             build_draft_attn_metadata_factory(
                 self.input_buffers.positions,
                 num_tokens_padded,
-                is_prefilling=torch.zeros(num_reqs_padded, dtype=torch.bool),
+                is_prefilling=is_prefilling,
+                seq_lens_cpu=seq_lens_cpu,
                 attn_state=AscendAttentionState.ChunkedPrefill,
+                parallel_config=self.attn_vllm_config.parallel_config,
             ),
         ):
             attn_metadata = super()._build_draft_attn_metadata(
@@ -151,13 +189,18 @@ class AscendDSparkSpeculator(DSparkSpeculator):
         assert num_tokens_padded % self.num_query_per_req == 0, "Draft tokens must contain whole query groups"
         num_reqs_padded = num_tokens_padded // self.num_query_per_req
 
+        seq_lens_cpu, is_prefilling = self._prepare_draft_dcp_metadata_inputs(
+            kwargs["num_reqs"], num_reqs_padded, kwargs["step"]
+        )
         with (
             build_attn_metadata_wrapper(),
             build_draft_attn_metadata_factory(
                 self.input_buffers.positions,
                 num_tokens_padded,
-                is_prefilling=torch.zeros(num_reqs_padded, dtype=torch.bool),
+                is_prefilling=is_prefilling,
+                seq_lens_cpu=seq_lens_cpu,
                 attn_state=AscendAttentionState.ChunkedPrefill,
+                parallel_config=self.attn_vllm_config.parallel_config,
             ),
         ):
             attn_metadata = super()._build_draft_attn_metadata(num_reqs_padded=num_reqs_padded, **kwargs)
@@ -216,7 +259,10 @@ class AscendDSparkSpeculator(DSparkSpeculator):
         with (
             build_attn_metadata_wrapper(),
             build_draft_attn_metadata_factory(
-                self.input_buffers.positions, self.max_num_tokens, torch.from_numpy(self.input_batch.is_prefilling_np)
+                self.input_buffers.positions,
+                self.max_num_tokens,
+                torch.from_numpy(self.input_batch.is_prefilling_np),
+                parallel_config=self.attn_vllm_config.parallel_config,
             ),
         ):
             return super().propose(

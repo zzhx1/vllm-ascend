@@ -6,6 +6,7 @@ from unittest.mock import MagicMock
 
 import pytest
 import torch
+from vllm.config import AttentionConfig
 from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
 
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
@@ -17,6 +18,11 @@ from vllm_ascend.worker.v2.spec_decode.dspark.speculator import AscendDSparkSpec
 def make_speculator(architecture):
     spec = AscendDSparkSpeculator.__new__(AscendDSparkSpeculator)
     spec.attn_architecture = architecture
+    spec.use_dcp = False
+    spec.requires_non_causal = True
+    spec.vllm_config = SimpleNamespace(
+        attention_config=AttentionConfig(), parallel_config=SimpleNamespace(decode_context_parallel_size=1)
+    )
     spec.num_query_per_req = 5
     spec.input_buffers = SimpleNamespace(positions=torch.arange(32))
     return spec
@@ -58,8 +64,8 @@ def test_direct_non_dense_mla_builder_preserves_upstream_metadata(monkeypatch, m
     builder = MagicMock(return_value=layers)
     monkeypatch.setattr(DSparkSpeculator, "_build_draft_attn_metadata", builder)
 
-    assert spec._build_draft_attn_metadata(num_reqs=1, num_reqs_padded=2) is layers
-    builder.assert_called_once_with(num_reqs=1, num_reqs_padded=2)
+    assert spec._build_draft_attn_metadata(num_reqs=1, num_reqs_padded=2, num_tokens_padded=10, step=5) is layers
+    builder.assert_called_once_with(num_reqs=1, num_reqs_padded=2, num_tokens_padded=10, step=5)
     assert metadata.actual_seq_lengths_q is query_lengths
     assert not hasattr(metadata, "decode")
     assert getattr(metadata, "attn_state", None) is initial_attn_state
@@ -70,7 +76,7 @@ def test_direct_builder_preserves_empty_metadata(monkeypatch, architecture):
     spec = make_speculator(architecture)
     metadata: dict[str, SimpleNamespace] = {}
     monkeypatch.setattr(DSparkSpeculator, "_build_draft_attn_metadata", MagicMock(return_value=metadata))
-    assert spec._build_draft_attn_metadata(num_reqs=0, num_reqs_padded=1, num_tokens_padded=5) is metadata
+    assert spec._build_draft_attn_metadata(num_reqs=0, num_reqs_padded=1, num_tokens_padded=5, step=5) is metadata
 
 
 @pytest.mark.parametrize("architecture", ["GQA", "MLA"])

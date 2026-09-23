@@ -855,6 +855,8 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                     if self.dcp_size > 1 and draft_index > 0:
                         assert self.block_table_tensor_clone is not None, "block_table_tensor_clone is not init"
                         common_attn_metadata.block_table_tensor = self.block_table_tensor_clone[:num_reqs]
+                    if dcp_manager is not None:
+                        dcp_manager.prepare_common_attn_metadata(common_attn_metadata)
                     per_layer_attn_metadata = self._build_multi_group_graph_capture_metadata(
                         common_attn_metadata, draft_index
                     )
@@ -2567,6 +2569,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         # the cache empty in the non-compression path to avoid passing an
         # unexpected argument.
         shared_dsa_draft_cache: dict = dict(common_ratio_to_sas_metadata=dict()) if self.use_compress else {}
+        dcp_manager = getattr(self.runner, "dcp_manager", None)
         device_metadata_tasks: list[DeviceMetadataTask] = []
         device_metadata_executor = (
             getattr(self.runner, "device_metadata_executor", None)
@@ -2605,12 +2608,16 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 # (dspark only - self.sliding_window is None for MTP.)
                 if self.sliding_window is not None:
                     self.sliding_window.apply(common_attn_metadata)
+                if dcp_manager is not None:
+                    dcp_manager.prepare_common_attn_metadata(common_attn_metadata)
                 attn_metadata = builder.build_for_drafting(
                     common_attn_metadata, draft_index=1, **extra_attn_metadata_args
                 )
                 if device_metadata_provider is not None:
                     device_metadata_tasks.extend(device_metadata_provider.take_device_metadata_tasks())
             else:
+                if dcp_manager is not None:
+                    dcp_manager.prepare_common_attn_metadata(common_attn_metadata)
                 attn_metadata = builder.build(
                     0, common_attn_metadata, self.runner.get_model(), **extra_attn_metadata_args
                 )
