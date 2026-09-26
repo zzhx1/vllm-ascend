@@ -2,12 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM Ascend project
 
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 from vllm.distributed.eplb.policy import AbstractEplbPolicy
 
 from vllm_ascend.ascend_config import StairConfig
-from vllm_ascend.distributed.eplb.policy.stair import StairEplbPolicy
+from vllm_ascend.distributed.eplb.policy.stair import PlacementImbalance, PlacementPlan, StairEplbPolicy, StairPlan
 
 
 class TestStairLoadStatistics(unittest.TestCase):
@@ -238,6 +239,563 @@ class TestStairLoadStatistics(unittest.TestCase):
 
         self.assertEqual(len(candidates), 1)
         np.testing.assert_array_equal(candidates[0], expected)
+
+    def test_incremental_replica_candidates_start_from_current_counts(self):
+        current = np.array([[0, 1], [0, 2]])
+        candidates = StairEplbPolicy.incremental_replica_candidates(
+            np.array([1.0, 8.0, 2.0]),
+            current,
+            num_ranks=2,
+            max_replica_changes=1,
+            num_stages=3,
+            budget_radius=2,
+            beam_size=8,
+        )
+
+        current_counts = np.array([2, 1, 1])
+        self.assertTrue(any(np.array_equal(candidate, current_counts) for candidate in candidates))
+        self.assertTrue(all(np.abs(candidate - current_counts).sum() <= 2 for candidate in candidates))
+
+    def test_incremental_replica_candidates_keep_zero_redundancy_counts(self):
+        current = np.array([[0, 1], [2, 3]])
+        candidates = StairEplbPolicy.incremental_replica_candidates(
+            np.array([8.0, 4.0, 2.0, 1.0]),
+            current,
+            num_ranks=2,
+            max_replica_changes=2,
+            num_stages=4,
+            budget_radius=2,
+            beam_size=8,
+        )
+
+        self.assertEqual(len(candidates), 1)
+        np.testing.assert_array_equal(candidates[0], np.ones(4, dtype=np.int64))
+
+    def test_lpt_placement_co_locates_negatively_correlated_experts(self):
+        means = np.zeros(4)
+        variances = np.ones(4)
+        covariance = np.eye(4)
+        covariance[0, 1] = covariance[1, 0] = -0.9
+
+        placement = StairEplbPolicy.lpt_placement(
+            means,
+            variances,
+            covariance,
+            np.ones(4, dtype=np.int64),
+            num_ranks=2,
+            z_score=1.0,
+            current_rank_expert_ids=np.array([[0, 1], [2, 3]]),
+            rank_node_ids=np.zeros(2, dtype=np.int64),
+            rank_transfer_limit=1,
+            cross_node_transfer_limit=1,
+            backtrack_limit=0,
+        )
+
+        np.testing.assert_array_equal(placement.rank_expert_ids, [[0, 1], [2, 3]])
+
+    def test_lpt_placement_is_deterministic_and_preserves_replica_constraints(self):
+        kwargs = dict(
+            expert_means=np.array([8.0, 3.0, 1.0]),
+            expert_variances=np.array([2.0, 1.0, 0.5]),
+            expert_covariance=np.diag([2.0, 1.0, 0.5]),
+            replica_counts=np.array([2, 1, 1]),
+            num_ranks=2,
+            z_score=0.5,
+            current_rank_expert_ids=np.array([[0, 1], [0, 2]]),
+            rank_node_ids=np.zeros(2, dtype=np.int64),
+            rank_transfer_limit=1,
+            cross_node_transfer_limit=1,
+            backtrack_limit=0,
+        )
+
+        first = StairEplbPolicy.lpt_placement(**kwargs)
+        second = StairEplbPolicy.lpt_placement(**kwargs)
+
+        np.testing.assert_array_equal(first.rank_expert_ids, second.rank_expert_ids)
+        np.testing.assert_array_equal(first.source_rank_ids, second.source_rank_ids)
+        np.testing.assert_array_equal(first.source_slot_ids, second.source_slot_ids)
+        self.assertTrue(all(len(set(rank)) == len(rank) for rank in first.rank_expert_ids.tolist()))
+        np.testing.assert_array_equal(StairEplbPolicy.placement_replica_counts(first.rank_expert_ids, 3), [2, 1, 1])
+
+    def test_lpt_placement_rejects_invalid_covariance_shape(self):
+        with self.assertRaises(ValueError):
+            StairEplbPolicy.lpt_placement(
+                np.ones(2),
+                np.ones(2),
+                np.ones((2, 3)),
+                np.ones(2, dtype=np.int64),
+                2,
+                0.5,
+                current_rank_expert_ids=np.array([[0], [1]]),
+                rank_node_ids=np.zeros(2, dtype=np.int64),
+                rank_transfer_limit=1,
+                cross_node_transfer_limit=1,
+                backtrack_limit=0,
+            )
+
+    def test_lpt_placement_rejects_uneven_rank_capacity(self):
+        with self.assertRaises(ValueError):
+            StairEplbPolicy.lpt_placement(
+                np.ones(2),
+                np.ones(2),
+                np.eye(2),
+                np.array([1, 2]),
+                2,
+                0.5,
+                current_rank_expert_ids=np.array([[0], [1]]),
+                rank_node_ids=np.zeros(2, dtype=np.int64),
+                rank_transfer_limit=1,
+                cross_node_transfer_limit=1,
+                backtrack_limit=0,
+            )
+
+    def test_lpt_placement_rejects_invalid_rank_nodes(self):
+        with self.assertRaisesRegex(ValueError, "rank_node_ids"):
+            StairEplbPolicy.lpt_placement(
+                np.ones(2),
+                np.ones(2),
+                np.eye(2),
+                np.ones(2, dtype=np.int64),
+                2,
+                0.5,
+                current_rank_expert_ids=np.array([[0], [1]]),
+                rank_node_ids=np.array([0]),
+                rank_transfer_limit=1,
+                cross_node_transfer_limit=1,
+                backtrack_limit=0,
+            )
+
+    def test_migration_sources_enforce_rank_transfer_limit(self):
+        current = np.array([[0, 1], [2, 3], [4, 5]])
+        target = np.array([[2, 3], [0, 4], [1, 5]])
+        expert_sources = [np.flatnonzero(np.any(current == expert, axis=1)).tolist() for expert in range(6)]
+        node_ids = np.zeros(3, dtype=np.int64)
+
+        self.assertIsNone(StairEplbPolicy._migration_sources(current, target, 1, 1, expert_sources, node_ids))
+        sources = StairEplbPolicy._migration_sources(current, target, 2, 1, expert_sources, node_ids)
+
+        np.testing.assert_array_equal(sources, [[1, 1], [0, 2], [0, 2]])
+        np.testing.assert_array_equal(
+            StairEplbPolicy._migration_sources(current, target, -1, 1, expert_sources, node_ids),
+            sources,
+        )
+
+    def test_migration_sources_reassign_earlier_demand(self):
+        current = np.array([[2, 4], [3, 5], [0, 1], [0, 6]])
+        partial_target = np.full_like(current, -1)
+        partial_target[0, 0] = 0
+        partial_target[1, 0] = 1
+        expert_sources = [np.flatnonzero(np.any(current == expert, axis=1)).tolist() for expert in range(7)]
+
+        sources = StairEplbPolicy._migration_sources(
+            current, partial_target, 1, 1, expert_sources, np.zeros(4, dtype=np.int64)
+        )
+
+        self.assertEqual(sources[0, 0], 3)
+        self.assertEqual(sources[1, 0], 2)
+
+    def test_migration_sources_enforce_cross_node_limit(self):
+        current = np.array([[0], [1], [2], [3]])
+        target = np.array([[2], [3], [0], [1]])
+        expert_sources = [[expert] for expert in range(4)]
+        node_ids = np.array([0, 0, 1, 1])
+
+        self.assertIsNone(StairEplbPolicy._migration_sources(current, target, 1, 1, expert_sources, node_ids))
+        sources = StairEplbPolicy._migration_sources(current, target, 1, 2, expert_sources, node_ids)
+
+        np.testing.assert_array_equal(sources, [[2], [3], [0], [1]])
+        np.testing.assert_array_equal(
+            StairEplbPolicy._migration_sources(current, target, 1, -1, expert_sources, node_ids),
+            sources,
+        )
+
+    def test_migration_sources_allow_disabling_cross_node_transfers(self):
+        current = np.array([[0], [1]])
+        target = np.array([[1], [0]])
+        expert_sources = [[0], [1]]
+
+        self.assertIsNone(StairEplbPolicy._migration_sources(current, target, 1, 0, expert_sources, np.array([0, 1])))
+
+    def test_migration_sources_follow_multi_hop_augmenting_path(self):
+        current = np.array([[3, 4, 5], [0, 2, 6], [0, 1, 7], [1, 8, 9]])
+        partial_target = np.full_like(current, -1)
+        partial_target[0, 0] = 0
+        partial_target[1, 0] = 1
+        partial_target[2, 0] = 2
+        expert_sources = [np.where(current == expert)[0].tolist() for expert in range(10)]
+
+        sources = StairEplbPolicy._migration_sources(
+            current, partial_target, 1, 1, expert_sources, np.zeros(4, dtype=np.int64)
+        )
+
+        np.testing.assert_array_equal(sources[:3, 0], [2, 3, 1])
+
+    def test_minimum_cost_sources_prefer_same_node_then_lowest_rank(self):
+        current = np.array([[1], [0], [0]])
+        target = np.array([[0], [-1], [-1]])
+        expert_sources = [[1, 2], [0]]
+
+        same_node = StairEplbPolicy._migration_sources(current, target, 1, 1, expert_sources, np.array([0, 1, 0]))
+        tied = StairEplbPolicy._migration_sources(current, target, 1, 1, expert_sources, np.zeros(3, dtype=np.int64))
+
+        self.assertEqual(same_node[0, 0], 2)
+        self.assertEqual(tied[0, 0], 1)
+
+    def test_minimum_cost_sources_preserve_global_topology_optimum(self):
+        current = np.array([[2, 6], [3, 7], [0, 1], [0, 4], [1, 5]])
+        target = np.full_like(current, -1)
+        target[0, 0] = 0
+        target[1, 0] = 1
+        expert_sources = [np.where(current == expert)[0].tolist() for expert in range(8)]
+
+        sources = StairEplbPolicy._migration_sources(current, target, 1, 1, expert_sources, np.array([0, 0, 0, 0, 1]))
+
+        # Taking rank 2 for expert 0 would force expert 1 to cross nodes.
+        np.testing.assert_array_equal(sources[:2, 0], [3, 2])
+
+    def test_lpt_placement_aligns_slots_with_topology_aware_sources(self):
+        current = np.array([[2, 0], [1, 0], [3, 1]])
+        placement = StairEplbPolicy.lpt_placement(
+            np.zeros(4),
+            np.zeros(4),
+            np.zeros((4, 4)),
+            np.array([2, 2, 1, 1]),
+            num_ranks=3,
+            z_score=0.0,
+            current_rank_expert_ids=current,
+            rank_node_ids=np.array([0, 1, 0]),
+            rank_transfer_limit=1,
+            cross_node_transfer_limit=1,
+            backtrack_limit=0,
+        )
+
+        self.assertIsNotNone(placement)
+        np.testing.assert_array_equal(placement.rank_expert_ids, [[1, 0], [1, 0], [3, 2]])
+        np.testing.assert_array_equal(placement.source_rank_ids, [[2, 0], [1, 1], [2, 0]])
+        np.testing.assert_array_equal(placement.source_slot_ids, [[1, 1], [0, 1], [0, 0]])
+
+    def test_lpt_variance_scales_by_replica_count(self):
+        variance, scale = StairEplbPolicy._updated_rank_variance(
+            expert=1,
+            rank_experts=np.array([0]),
+            current_variance=1.0,
+            current_scale=1.0,
+            expert_variances=np.array([4.0, 9.0]),
+            expert_covariance=np.array([[4.0, 6.0], [6.0, 9.0]]),
+            replica_counts=np.array([2, 3]),
+        )
+
+        self.assertEqual(variance, 4.0)
+        self.assertEqual(scale, 4.0)
+
+    def test_lpt_placement_backtracks_from_greedy_dead_end(self):
+        means = np.array([100.0, 6.0, 5.0, 4.0, 3.0, 2.0, 3.0])
+        current = np.array([[0, 1, 6], [2, 3, 6], [4, 5, 6]])
+        kwargs = dict(
+            expert_means=means,
+            expert_variances=np.zeros(7),
+            expert_covariance=np.zeros((7, 7)),
+            replica_counts=np.array([1, 1, 1, 1, 1, 1, 3]),
+            num_ranks=3,
+            z_score=0.0,
+            current_rank_expert_ids=current,
+            rank_node_ids=np.zeros(3, dtype=np.int64),
+            rank_transfer_limit=1,
+            cross_node_transfer_limit=1,
+        )
+
+        # Greedy choices fill one rank too early, leaving no three distinct
+        # ranks for the final expert even though a valid placement exists.
+        self.assertIsNone(StairEplbPolicy.lpt_placement(**kwargs, backtrack_limit=1))
+        placement = StairEplbPolicy.lpt_placement(**kwargs, backtrack_limit=2)
+
+        self.assertIsNotNone(placement)
+        for dst_rank, target_experts in enumerate(placement.rank_expert_ids):
+            for slot, expert in enumerate(target_experts):
+                self.assertIn(expert, current[placement.source_rank_ids[dst_rank, slot]])
+            for src_rank in range(3):
+                if src_rank != dst_rank:
+                    self.assertLessEqual(np.sum(placement.source_rank_ids[dst_rank] == src_rank), 1)
+
+    def test_lpt_placement_accepts_valid_covariance_with_strong_cancellation(self):
+        deviations = np.array([-0.04, -0.01, 0.03, -0.15, 0.20, 43.74, 0.18, -43.95])
+        center = np.full(8, 44.95)
+        samples = np.stack([center + deviations, center - deviations])
+        means, variances, covariance = StairEplbPolicy.weighted_moments(samples, np.ones(2, dtype=np.int64))
+
+        placement = StairEplbPolicy.lpt_placement(
+            means,
+            variances,
+            covariance,
+            np.ones(8, dtype=np.int64),
+            num_ranks=1,
+            z_score=1.0,
+            current_rank_expert_ids=np.arange(8).reshape(1, 8),
+            rank_node_ids=np.zeros(1, dtype=np.int64),
+            rank_transfer_limit=1,
+            cross_node_transfer_limit=1,
+            backtrack_limit=0,
+        )
+
+        self.assertIsNotNone(placement)
+
+    def test_lpt_placement_rejects_small_indefinite_covariance(self):
+        with self.assertRaises(ValueError):
+            StairEplbPolicy.lpt_placement(
+                np.zeros(2),
+                np.full(2, 1e-30),
+                np.array([[1e-30, -1e-15], [-1e-15, 1e-30]]),
+                np.ones(2, dtype=np.int64),
+                num_ranks=1,
+                z_score=1.0,
+                current_rank_expert_ids=np.array([[0, 1]]),
+                rank_node_ids=np.zeros(1, dtype=np.int64),
+                rank_transfer_limit=1,
+                cross_node_transfer_limit=1,
+                backtrack_limit=0,
+            )
+
+    def test_plan_layer_accepts_mean_improvement(self):
+        samples = np.array([[8.0, 7.0, 6.0, 5.0]])
+        current = np.array([[0, 1], [2, 3]])
+
+        plan = StairEplbPolicy.plan_layer(
+            samples,
+            np.ones(1, dtype=np.int64),
+            current,
+            np.array([0, 1]),
+            StairConfig(),
+        )
+
+        self.assertIsNotNone(plan)
+        np.testing.assert_array_equal(plan.placement.rank_expert_ids, [[0, 3], [2, 1]])
+        self.assertEqual(plan.predicted_imbalance.mean_ratio, 1.0)
+
+    def test_plan_layer_can_disable_cross_node_improvement(self):
+        plan = StairEplbPolicy.plan_layer(
+            np.array([[8.0, 7.0, 6.0, 5.0]]),
+            np.ones(1, dtype=np.int64),
+            np.array([[0, 1], [2, 3]]),
+            np.array([0, 1]),
+            StairConfig(cross_node_transfer_limit=0),
+        )
+
+        self.assertIsNone(plan)
+
+    def test_plan_layer_skips_noop(self):
+        self.assertIsNone(
+            StairEplbPolicy.plan_layer(
+                np.array([[8.0, 7.0, 6.0, 5.0]]),
+                np.ones(1, dtype=np.int64),
+                np.array([[0, 3], [2, 1]]),
+                np.array([0, 1]),
+                StairConfig(),
+            )
+        )
+
+    def test_plan_layer_breaks_mean_tie_by_migration_count(self):
+        plan = StairEplbPolicy.plan_layer(
+            np.ones((1, 3)),
+            np.ones(1, dtype=np.int64),
+            np.array([[0, 2], [0, 1]]),
+            np.array([0, 1]),
+            StairConfig(),
+        )
+
+        self.assertIsNotNone(plan)
+        self.assertEqual(plan.predicted_imbalance.mean_ratio, 1.0)
+        np.testing.assert_array_equal(plan.placement.rank_expert_ids, [[0, 2], [2, 1]])
+        self.assertEqual(np.sum(plan.placement.source_rank_ids != np.arange(2)[:, None]), 1)
+
+    def test_plan_layer_rejects_mean_regression(self):
+        samples = np.array(
+            [
+                [21, 28, 26, 15],
+                [28, 29, 29, 2],
+                [13, 18, 8, 11],
+                [18, 24, 17, 5],
+                [20, 26, 6, 16],
+            ]
+        )
+
+        plan = StairEplbPolicy.plan_layer(
+            samples,
+            np.array([2, 5, 1, 3, 5]),
+            np.array([[0, 3], [1, 2]]),
+            np.array([0, 1]),
+            StairConfig(),
+        )
+
+        self.assertIsNone(plan)
+
+    def test_plan_layer_rejects_p95_regression(self):
+        placement = PlacementPlan(
+            rank_expert_ids=np.array([[0, 2], [1, 3]]),
+            source_rank_ids=np.array([[0, 1], [0, 1]]),
+            source_slot_ids=np.array([[0, 0], [1, 1]]),
+        )
+        with (
+            patch.object(StairEplbPolicy, "replica_candidates", return_value=[np.ones(4, dtype=np.int64)]),
+            patch.object(StairEplbPolicy, "lpt_placement", return_value=placement),
+            patch.object(
+                StairEplbPolicy,
+                "placement_imbalance",
+                side_effect=[PlacementImbalance(1.1, 1.0), PlacementImbalance(1.0, 1.1)],
+            ),
+        ):
+            plan = StairEplbPolicy.plan_layer(
+                np.ones((1, 4)),
+                np.ones(1, dtype=np.int64),
+                np.array([[0, 1], [2, 3]]),
+                np.array([0, 1]),
+                StairConfig(),
+            )
+
+        self.assertIsNone(plan)
+
+    def test_plan_rebalance_preserves_filtered_layers(self):
+        samples = np.array(
+            [
+                [
+                    [0.0, 0.0, 0.0, 0.0],
+                    [1.0, 1.0, 1.0, 1.0],
+                    [8.0, 7.0, 6.0, 5.0],
+                ]
+            ]
+        )
+        current = np.array(
+            [
+                [[0, 1], [2, 3]],
+                [[0, 3], [2, 1]],
+                [[0, 1], [2, 3]],
+            ]
+        )
+
+        plan = StairEplbPolicy.plan_rebalance(
+            samples,
+            current,
+            np.array([np.nan, 1.0, np.nan]),
+            np.array([0, 1]),
+            StairConfig(),
+        )
+
+        np.testing.assert_array_equal(plan.rank_expert_ids[:2], current[:2])
+        np.testing.assert_array_equal(plan.source_rank_ids[:2], [[[0, 0], [1, 1]]] * 2)
+        np.testing.assert_array_equal(plan.source_slot_ids[:2], [[[0, 1], [0, 1]]] * 2)
+        np.testing.assert_array_equal(plan.rank_expert_ids[2], [[0, 3], [2, 1]])
+        np.testing.assert_array_equal(np.isnan(plan.predicted_mean_ratios), [True, True, False])
+        self.assertEqual(plan.predicted_mean_ratios[2], 1.0)
+
+    def test_plan_rebalance_orders_equal_mean_ratios_by_relative_deterioration(self):
+        samples = np.array([[[3.0, 1.0], [6.0, 2.0]]])
+        current = np.array([[[0], [1]], [[0], [1]]])
+        planned_load_totals = []
+
+        # Both layers have ratio 1.5; layer 0 deteriorated further from its anchor.
+        with patch.object(
+            StairEplbPolicy,
+            "plan_layer",
+            side_effect=lambda load, *_: planned_load_totals.append(float(load.sum())),
+        ):
+            StairEplbPolicy.plan_rebalance(
+                samples,
+                current,
+                np.array([1.1, 1.3]),
+                np.array([0, 1]),
+                StairConfig(),
+            )
+
+        self.assertEqual(planned_load_totals, [4.0, 8.0])
+
+    def test_validate_plan_accepts_explicit_sources(self):
+        current = np.array([[[0, 1], [2, 3]]])
+        plan = StairPlan(
+            rank_expert_ids=np.array([[[0, 2], [1, 3]]]),
+            source_rank_ids=np.array([[[0, 1], [0, 1]]]),
+            source_slot_ids=np.array([[[0, 0], [1, 1]]]),
+            predicted_mean_ratios=np.array([1.0]),
+        )
+
+        StairEplbPolicy.validate_plan(current, plan, 4, np.zeros(2, dtype=np.int64), 1, 1)
+
+    def test_validate_plan_accepts_zero_redundancy_three_rank_cycle(self):
+        current = np.array([[[0], [1], [2]]])
+        plan = StairPlan(
+            rank_expert_ids=np.array([[[1], [2], [0]]]),
+            source_rank_ids=np.array([[[1], [2], [0]]]),
+            source_slot_ids=np.zeros_like(current),
+            predicted_mean_ratios=np.array([1.0]),
+        )
+
+        StairEplbPolicy.validate_plan(current, plan, 3, np.zeros(3, dtype=np.int64), 1, 1)
+
+    def test_validate_plan_rejects_false_source_ownership(self):
+        current = np.array([[[0, 1], [2, 3]]])
+        plan = StairPlan(
+            rank_expert_ids=np.array([[[0, 2], [1, 3]]]),
+            source_rank_ids=np.array([[[0, 1], [0, 1]]]),
+            source_slot_ids=np.array([[[0, 1], [1, 1]]]),
+            predicted_mean_ratios=np.array([1.0]),
+        )
+
+        with self.assertRaisesRegex(ValueError, "does not own"):
+            StairEplbPolicy.validate_plan(current, plan, 4, np.zeros(2, dtype=np.int64), 1, 1)
+
+    def test_validate_plan_accepts_unlimited_transfer_budgets(self):
+        current = np.array([[[0, 1], [2, 3], [4, 5]]])
+        plan = StairPlan(
+            rank_expert_ids=np.array([[[2, 3], [0, 1], [4, 5]]]),
+            source_rank_ids=np.array([[[1, 1], [0, 0], [2, 2]]]),
+            source_slot_ids=np.array([[[0, 1], [0, 1], [0, 1]]]),
+            predicted_mean_ratios=np.array([1.0]),
+        )
+
+        StairEplbPolicy.validate_plan(current, plan, 6, np.arange(3), -1, -1)
+
+    def test_validate_plan_rejects_invalid_controls(self):
+        current = np.array([[[0, 1], [2, 3], [4, 5]]])
+        plan = StairPlan(
+            rank_expert_ids=np.array([[[2, 3], [0, 1], [4, 5]]]),
+            source_rank_ids=np.array([[[1, 1], [0, 0], [2, 2]]]),
+            source_slot_ids=np.array([[[0, 1], [0, 1], [0, 1]]]),
+            predicted_mean_ratios=np.array([1.0]),
+        )
+
+        invalid_controls = ((6.0, 1, 1), (6, 0, 1), (6, 1.5, 1), (6, 1, -2), (6, 1, True))
+        for num_experts, rank_limit, node_limit in invalid_controls:
+            with self.subTest(controls=(num_experts, rank_limit, node_limit)), self.assertRaises(ValueError):
+                StairEplbPolicy.validate_plan(
+                    current,
+                    plan,
+                    num_experts,
+                    np.zeros(3, dtype=np.int64),
+                    rank_limit,
+                    node_limit,
+                )
+
+    def test_validate_plan_rejects_prediction_for_unchanged_layer(self):
+        current = np.array([[[0], [1]]])
+        plan = StairPlan(
+            rank_expert_ids=current.copy(),
+            source_rank_ids=np.array([[[0], [1]]]),
+            source_slot_ids=np.zeros_like(current),
+            predicted_mean_ratios=np.array([1.0]),
+        )
+
+        with self.assertRaisesRegex(ValueError, "finite for changed layers"):
+            StairEplbPolicy.validate_plan(current, plan, 2, np.zeros(2, dtype=np.int64), 1, 1)
+
+    def test_validate_plan_rejects_non_float_predictions(self):
+        current = np.array([[[0], [1]]])
+        plan = StairPlan(
+            rank_expert_ids=current.copy(),
+            source_rank_ids=np.array([[[0], [1]]]),
+            source_slot_ids=np.zeros_like(current),
+            predicted_mean_ratios=np.array([True]),
+        )
+
+        with self.assertRaisesRegex(ValueError, "floating-point"):
+            StairEplbPolicy.validate_plan(current, plan, 2, np.zeros(2, dtype=np.int64), 1, 1)
 
     def test_statistics_reject_invalid_inputs(self):
         invalid_samples = np.array([[[1.0, -1.0]]])
