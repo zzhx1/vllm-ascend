@@ -8,7 +8,9 @@ import pytest
 import torch
 from vllm.distributed.eplb import eplb_state as upstream_eplb_state
 
+from vllm_ascend.ascend_config import StairConfig
 from vllm_ascend.distributed.eplb import state as eplb_state
+from vllm_ascend.distributed.eplb.policy.stair import StairEplbPolicy
 from vllm_ascend.distributed.eplb.state import (
     AscendEplbLayerState,
     AscendEplbState,
@@ -29,6 +31,16 @@ def test_result_readiness_waits_for_next_rearrangement_boundary():
 
     state.expert_rearrangement_step = 10
     assert state._all_ranks_result_ready(model_state)
+
+
+def test_configured_upstream_policy_registration_is_scoped():
+    policy = StairEplbPolicy(StairConfig())
+    assert "stair" not in upstream_eplb_state.EPLB_POLICIES
+
+    with eplb_state._configured_upstream_policy("stair", policy):
+        assert upstream_eplb_state.EPLB_POLICIES["stair"] is policy
+
+    assert "stair" not in upstream_eplb_state.EPLB_POLICIES
 
 
 def test_drain_async_accepts_last_changed_layer_before_model_end():
@@ -160,7 +172,9 @@ def test_from_mapping_refreshes_final_mapping(monkeypatch):
         model=object(),
         model_config=object(),
         device=torch.device("cpu"),
-        parallel_config=object(),
+        parallel_config=SimpleNamespace(
+            eplb_config=SimpleNamespace(policy="default"),
+        ),
         expanded_physical_to_logical=torch.zeros(1),
     )
 
@@ -198,7 +212,9 @@ def test_from_mapping_forwards_release_valid_expert_count(monkeypatch):
         model=object(),
         model_config=object(),
         device=torch.device("cpu"),
-        parallel_config=object(),
+        parallel_config=SimpleNamespace(
+            eplb_config=SimpleNamespace(policy="default"),
+        ),
         expanded_physical_to_logical=torch.zeros((1, 2)),
         num_valid_physical_experts=1,
     )
