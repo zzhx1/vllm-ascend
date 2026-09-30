@@ -468,7 +468,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         self._maybe_share_lm_head(target_language_model)
 
         # Align draft weights before precomputing draft hidden states.
-        if self.method == "dspark" and hasattr(self.model, "post_process"):
+        if self.method in ("dspark", "dflash") and hasattr(self.model, "post_process"):
             self.model.post_process(self.vllm_config)
 
         if (
@@ -1137,7 +1137,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             num_reqs_padded = common_attn_metadata.num_reqs
             # In the below scenario, padding has been applied by _pad_query_start_loc_for_fia in the model runner.
             # We need to unpad here for eager mode to maintain compatibility.
-            if not self.vllm_config.model_config.use_mla and self.dcp_size == 1:
+            if not self.draft_model_config.use_mla and self.dcp_size == 1:
                 common_attn_metadata.block_table_tensor = self._adjust_tensor(
                     common_attn_metadata.block_table_tensor, num_reqs_padded
                 )
