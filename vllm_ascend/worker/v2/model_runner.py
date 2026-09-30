@@ -103,6 +103,7 @@ class NPUModelRunner(GPUModelRunner):
     supports_standardized_shared_kv_backing = True
 
     execute_model_state: ExecuteModelState | None
+    max_num_reqs: int
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         # Ascend-specific configurations
@@ -769,6 +770,21 @@ class NPUModelRunner(GPUModelRunner):
 
         return sampler_output, sampler_output.num_sampled, sampler_output.num_rejected
 
+    @contextmanager
+    def _cap_parallel_draft_dummy_reqs(self, uniform_decode: bool):
+        # TODO: Remove this context and its use once main2main includes
+        # https://github.com/vllm-project/vllm/pull/56448. Until then,
+        # profiling can exceed the speculator's query buffer.
+        original_max_num_reqs = self.max_num_reqs
+        if self.speculator is not None and not uniform_decode:
+            # Other speculators use one query row per request in vLLM v0.30.0.
+            query_width = getattr(self.speculator, "num_query_per_req", 1)
+            self.max_num_reqs = min(original_max_num_reqs, self.max_num_tokens // query_width)
+        try:
+            yield
+        finally:
+            self.max_num_reqs = original_max_num_reqs
+
     @step_eplb_after(is_dummy=True)
     def _dummy_run(
         self,
@@ -794,7 +810,7 @@ class NPUModelRunner(GPUModelRunner):
                 "the profile-run marker, which makes XLite bypass its graph path."
             )
         load_balance_ctx = override_mrv2_in_profile_run(True) if profile_adaptive_tail else nullcontext()
-        with skip_ring_state_update(skip_ring), load_balance_ctx:
+        with self._cap_parallel_draft_dummy_reqs(uniform_decode), skip_ring_state_update(skip_ring), load_balance_ctx:
             hidden_states, sample_hidden_states = super()._dummy_run(
                 num_tokens,
                 *args,
