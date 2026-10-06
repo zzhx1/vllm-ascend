@@ -45,6 +45,8 @@ from vllm_ascend.utils import (
     COMPILATION_PASS_KEY,
     COMPRESSED_TENSORS_METHOD,
     FP8_METHOD,
+    dsv4_skips_indexer_topk,
+    get_dsv4_compress_ratio,
     bootstrap_custom_op_env,
     check_kv_extra_config,
     enable_sfa_dcp_replicated_indexer,
@@ -426,7 +428,25 @@ class NPUPlatform(Platform):
             if start_layer >= end_layer:
                 continue
 
-            if use_index_cache:
+            if use_index_cache and getattr(config, "compress_ratios", None) is not None:
+                # V4 counts only c4 Indexers, not transformer layers. Dense
+                # and c128 layers do not populate the shared Top-K buffer.
+                has_topk = False
+                for layer_id in range(start_layer, end_layer):
+                    if get_dsv4_compress_ratio(config, layer_id) != 4:
+                        continue
+                    if dsv4_skips_indexer_topk(config, layer_id, start_layer):
+                        if not has_topk:
+                            raise ValueError(
+                                "Index cache dependency crosses a pipeline-parallel stage boundary: "
+                                f"PP rank {pp_rank}/{pp_size} owns layers [{start_layer}, {end_layer}), "
+                                f"but layer {layer_id} skips Top-K computation without a preceding "
+                                "Top-K recomputation in the same PP stage. "
+                                "Cross-PP Top-K index propagation is not supported."
+                            )
+                    else:
+                        has_topk = True
+            elif use_index_cache:
                 index_topk_pattern = getattr(config, "index_topk_pattern", None)
                 if index_topk_pattern is None:
                     index_topk_freq = getattr(config, "index_topk_freq", 1)

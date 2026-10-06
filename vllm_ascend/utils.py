@@ -117,6 +117,30 @@ def get_dsv4_compress_ratio(config: Any, layer_idx: int) -> int:
     return compress_ratios[layer_idx]
 
 
+def dsv4_skips_indexer_topk(config: Any, layer_idx: int, pp_start_layer: int | None = None) -> bool:
+    """Whether a main-model V4 layer reuses another Indexer's Top-K indices.
+
+    Each PP stage anchors its local cache at its first C4 layer. Later C4
+    layers keep the configured global reuse schedule.
+    """
+    if not getattr(config, "use_index_cache", False) or get_dsv4_compress_ratio(config, layer_idx) != 4:
+        return False
+    compress_ratios = getattr(config, "compress_ratios", None) or []
+    indexer_seq_idx = sum(ratio == 4 for ratio in compress_ratios[:layer_idx])
+    pattern = getattr(config, "index_topk_pattern", None)
+    if pattern is None:
+        freq = getattr(config, "index_topk_freq", 1)
+        skip_topk = max(indexer_seq_idx - 1, 0) % freq != 0
+    else:
+        assert pattern[0] == "F", "index_topk_pattern must start with 'F'"
+        skip_topk = indexer_seq_idx < len(pattern) and pattern[indexer_seq_idx] == "S"
+    if skip_topk and pp_start_layer is not None:
+        # C128 and dense stage-start layers cannot initialize this buffer.
+        # Override only the first local C4, not the rest of the reuse group.
+        return any(ratio == 4 for ratio in compress_ratios[pp_start_layer:layer_idx])
+    return skip_topk
+
+
 def is_deepseek_v41(hf_config: Any) -> bool:
     """Identify the released V4.1 config at the model boundary."""
     model_types = ("deepseek_v41", "deepseek_v41_text")
