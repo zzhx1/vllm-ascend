@@ -1343,7 +1343,8 @@ at::Tensor npu_quant_lightning_indexer_v2_metadata_npu(
     std::string layout_k_str = std::string(layout_k);
     char *layout_k_ptr = const_cast<char *>(layout_k_str.c_str());
 
-    EXEC_NPU_CMD(aclnnQuantLightningIndexerV2Metadata, cu_seqlens_q_val, cu_seqlens_k_val, seqused_q_val, seqused_k_val,
+    EXEC_NPU_CMD(aclnnVllmAscendQuantLightningIndexerV2Metadata,
+                 cu_seqlens_q_val, cu_seqlens_k_val, seqused_q_val, seqused_k_val,
                  cmp_residual_k_val, num_heads_q, num_heads_k, head_dim, topk, quant_mode, batch_size, max_seqlen_q,
                  max_seqlen_k, layout_q_ptr, layout_k_ptr, mask_mode, cmp_ratio, output);
 
