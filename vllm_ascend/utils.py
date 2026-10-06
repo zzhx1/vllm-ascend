@@ -1340,6 +1340,20 @@ def has_layer_idx(model_instance: torch.nn.Module) -> bool:
     return hasattr(model_instance, "model") and hasattr(model_instance.model, "start_layer")
 
 
+# C8_MXFP (FP8 KV + E8M0 scales) on Ascend A5 uses 512-token kernel blocks for
+# the QFA path (the QFA D=256 requirement doc allows block sizes 512/1024).
+A5_C8_MXFP_KV_CACHE_BLOCK_SIZE = 512
+
+# Enabled with ``--kv-cache-dtype mxfp8``, like the other Ascend C8 KV cache
+# flavors. The ModelSlim checkpoint recipe (fa_v.scale weights) is loaded when
+# present; it is not the switch.
+C8_MXFP_KV_CACHE_DTYPE = "mxfp8"
+
+
+def is_c8_mxfp_kv_quant(vllm_config: VllmConfig) -> bool:
+    return vllm_config.cache_config.cache_dtype == C8_MXFP_KV_CACHE_DTYPE
+
+
 def refresh_block_size(vllm_config):
     """
     Refresh the block size in cache config.
@@ -1364,6 +1378,16 @@ def refresh_block_size(vllm_config):
 
     if cache_config.block_size is None:
         cache_config.block_size = 128
+
+    # Hybrid page padding is handled by the upstream cache planner. C8 only
+    # constrains the scheduler block to contain whole 512-token kernel blocks.
+    if is_c8_mxfp_kv_quant(vllm_config):
+        kernel_size = A5_C8_MXFP_KV_CACHE_BLOCK_SIZE
+        if cache_config.block_size % kernel_size:
+            if getattr(cache_config, "user_specified_block_size", False):
+                raise ValueError(f"C8_MXFP requires --block-size to be a multiple of {kernel_size}.")
+            cache_config.block_size = kernel_size
+        return
 
     if not scheduler_config or not model_config:
         return

@@ -122,6 +122,12 @@ from vllm.v1.worker.utils import (
 
 # yapf: enable
 from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend.attention.attention_c8_mxfp import (
+    AscendC8MXFPAttentionBackendImpl,
+    fill_mxfp_v_scale_cache,
+    mxfp_cache_spec,
+    mxfp_cache_views_for_spec,
+)
 from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAttentionState
 from vllm_ascend.attention.context_parallel.dsa_cp import AscendDSACPMetadataBuilder
 from vllm_ascend.attention.context_parallel.sfa_cp import AscendSFADCPMetadataBuilder
@@ -204,6 +210,7 @@ from vllm_ascend.utils import (
     get_c_env,
     get_kv_cache_tensor_layers,
     global_stream,
+    is_c8_mxfp_kv_quant,
     is_hidden_state_cache_spec,
     is_score_encoder_cache_manager,
     kv_cache_spec_uses_sparse_sfa_c8,
@@ -4687,6 +4694,16 @@ class NPUModelRunner(GPUModelRunner):
         offset = (aligned_addr - data_ptr) // tensor.element_size()
         return tensor[int(offset) :]
 
+    def _is_c8_mxfp_kv_cache(self, spec: AttentionSpec) -> bool:
+        return type(spec) is FullAttentionSpec and is_c8_mxfp_kv_quant(self.vllm_config)
+
+    def _fill_c8_mxfp_v_scale_caches(self, kv_caches: dict[str, Any]) -> None:
+        """Fill static V scales once, before graph capture or any request."""
+        for layer_name, cache in kv_caches.items():
+            layer = self.compilation_config.static_forward_context.get(layer_name)
+            if isinstance(getattr(layer, "impl", None), AscendC8MXFPAttentionBackendImpl):
+                fill_mxfp_v_scale_cache(layer.v_cache_scale, cache[3])
+
     def initialize_kv_cache_tensors(
         self,
         kv_cache_config: KVCacheConfig,
@@ -4716,6 +4733,8 @@ class NPUModelRunner(GPUModelRunner):
         for layer_name, target_layer_name in self.shared_kv_cache_layers.items():
             logger.debug("%s reuses KV cache of %s", layer_name, target_layer_name)
             kv_caches[layer_name] = kv_caches[target_layer_name]
+
+        self._fill_c8_mxfp_v_scale_caches(kv_caches)
 
         if any(
             isinstance(self.compilation_config.static_forward_context.get(name), v41_cache_layer_type)
@@ -5352,6 +5371,13 @@ class NPUModelRunner(GPUModelRunner):
                 kernel_block_size = (
                     group_kernel_block_size or current_kv_cache_spec.block_size
                 )
+
+                if self._is_c8_mxfp_kv_cache(current_kv_cache_spec):
+                    raw = kv_cache_raw_tensors[layer_name]
+                    if not isinstance(raw, torch.Tensor):
+                        raise ValueError("C8_MXFP requires one combined raw allocation per layer.")
+                    kv_caches[layer_name] = mxfp_cache_views_for_spec(raw, current_kv_cache_spec, kernel_block_size)
+                    continue
 
                 if layer_name in layer_tuple_strides:
                     block_stride = layer_tuple_strides[layer_name]
@@ -6102,6 +6128,8 @@ class NPUModelRunner(GPUModelRunner):
                     kv_cache_spec[layer_name] = spec
             elif isinstance(attn_module, Attention):
                 if spec := attn_module.get_kv_cache_spec(self.vllm_config):
+                    if self._is_c8_mxfp_kv_cache(spec):
+                        spec = mxfp_cache_spec(spec)
                     kv_cache_spec[layer_name] = spec
                     attn_layer_names.add(layer_name)
             elif isinstance(attn_module, MLAAttention):
