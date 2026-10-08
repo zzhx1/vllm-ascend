@@ -31,6 +31,7 @@ from vllm.sequence import IntermediateTensors
 from vllm.utils.torch_utils import async_tensor_h2d as async_copy_to_gpu
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.worker.dp_utils import skip_dp_coordination
 from vllm.v1.worker.gpu import model_runner as vllm_model_runner
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 from vllm.v1.worker.gpu.eplb_utils import step_eplb_after
@@ -63,14 +64,18 @@ from vllm_ascend.core.profiling_chunk_predictor import (
     _finish_profiling_chunk_timing,
     _start_profiling_chunk_timing,
 )
+from vllm_ascend.models.deepseek_v41.cache_config import uses_a5_packed_cache
 from vllm_ascend.ops.rotary_embedding import set_cos_and_sin, update_cos_sin
 from vllm_ascend.utils import (
+    is_deepseek_v41,
     is_pd_decode_recompute_scheduler_enabled,
     lmhead_tp_enable,
     lmhead_tp_max_num_logits,
     lmhead_tp_pad_rows,
     set_potential_max_tokens,
+    should_skip_allreduce_across_dp_group,
 )
+from vllm_ascend.worker.device_metadata import TargetDeviceMetadata
 from vllm_ascend.worker.utils import disable_compilation
 from vllm_ascend.worker.v2.aclgraph_utils import ModelAclGraphManager
 from vllm_ascend.worker.v2.attn_utils import (
@@ -330,6 +335,13 @@ class NPUModelRunner(GPUModelRunner):
                 if isinstance(module, DeepseekV41Compressor) and module.ratio == 2:
                     module.prepare_ring_compressor(self.max_num_tokens, self.device)
         prepare_v41_source_rope(self)
+        # Recreate along with KV initialization: profiling capture owns a
+        # throwaway model state and must not leak event/buffer bindings.
+        self.model_state.device_metadata = (
+            TargetDeviceMetadata()
+            if uses_a5_packed_cache() and self.model_config.architecture == "DeepseekV41ForCausalLM"
+            else None
+        )
 
         # Upstream has bound every local cache; publish sealed plans before
         # the worker can warm up, capture graphs or execute prefill requests.
@@ -388,15 +400,26 @@ class NPUModelRunner(GPUModelRunner):
             get_kv_transfer_group().handle_preemptions(kv_connector_metadata)
 
         self.model_state.kvpp_is_dummy_run = dummy_run or is_profile
-        output = super().execute_model(
-            scheduler_output,
-            intermediate_tensors=intermediate_tensors,
-            dummy_run=dummy_run,
-            skip_attn_for_dummy_run=skip_attn_for_dummy_run,
-            is_profile=is_profile,
-            context_len=context_len,
-            valid_dummy_state_slots=valid_dummy_state_slots,
+        dp_coordination_context = (
+            skip_dp_coordination() if should_skip_allreduce_across_dp_group(self.vllm_config) else nullcontext()
         )
+        forward_failed = True
+        with dp_coordination_context:
+            try:
+                output = super().execute_model(
+                    scheduler_output,
+                    intermediate_tensors=intermediate_tensors,
+                    dummy_run=dummy_run,
+                    skip_attn_for_dummy_run=skip_attn_for_dummy_run,
+                    is_profile=is_profile,
+                    context_len=context_len,
+                    valid_dummy_state_slots=valid_dummy_state_slots,
+                )
+                forward_failed = False
+            finally:
+                finish_execution = getattr(self.model_state, "finish_execution", None)
+                if finish_execution is not None:
+                    finish_execution(failed=forward_failed)
         self.model_state.kvpp_is_dummy_run = False
         if dummy_run and lmhead_tp_enable() and not is_profile and self.is_last_pp_rank:
             # lmhead TP: idle ranks never call sample(); join the target head
@@ -866,8 +889,13 @@ class NPUModelRunner(GPUModelRunner):
             query_start_loc,
         )
 
+        # TODO: Gate CPU length synchronization by backend requirements, not
+        # speculative decoding alone. V4.1 uses device lengths; extend this
+        # exemption to other backends that do not need exact CPU seq_lens.
         # Non-last PP stages receive rejections without owning a speculator.
-        if self.speculator is not None or self.sync_spec_pp_cpu_counts:
+        if (
+            self.speculator is not None and not is_deepseek_v41(self.model_config.hf_config)
+        ) or self.sync_spec_pp_cpu_counts:
             self._copy_num_computed_tokens_to_cpu()
 
     def postprocess_num_computed_tokens(self, input_batch: AscendInputBatch) -> None:
@@ -901,14 +929,17 @@ class NPUModelRunner(GPUModelRunner):
         # Speculative decoding needs corrected num_computed_tokens after rejection.
         # req_states.num_computed_tokens_cpu shares storage with its NumPy view,
         # so this update also corrects the num_computed_tokens_np used by PCP.
-        if self.speculator is not None or self.sync_spec_pp_cpu_counts:
+        if (
+            self.speculator is not None and not is_deepseek_v41(self.model_config.hf_config)
+        ) or self.sync_spec_pp_cpu_counts:
             # Blocks CPU submission until D2H completes; may stall the async pipeline.
             self.num_computed_tokens_event.synchronize()
             for req_id in scheduler_output.scheduled_cached_reqs.req_ids:
                 req_index = self.req_states.req_id_to_index[req_id]
                 self.req_states.num_computed_tokens_cpu[req_index] = self.num_computed_tokens_cpu[req_index]
 
-        # update seq_lens_cpu
+        # Without a CPU consumer, retain the upstream optimistic upper bound.
+        # prepare_pos_seq_lens still reads exact rejection-corrected NPU state.
         for i, req_id in enumerate(req_ids):  # type: ignore
             req_index = self.req_states.req_id_to_index[req_id]
             num_computed_tokens = self.req_states.num_computed_tokens_cpu[req_index]

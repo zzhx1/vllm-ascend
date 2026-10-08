@@ -29,7 +29,7 @@ from vllm.logger import logger
 from vllm.utils.math_utils import cdiv
 
 from vllm_ascend.config_utils import config
-from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
+from vllm_ascend.device.hardware_profile import DeviceAdaptorFamily, HardwareCapability, get_current_hardware_profile
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -424,6 +424,7 @@ class AscendConfig:
             "refresh": false,
             "enable_cpu_binding": true,
             "multistream_dsv4_dsa_overlap": true,
+            "multistream_engram_overlap": true,
             "enable_prefill_mc2": false,
             "multistream_overlap_shared_expert": false,
             "enable_kv_nz": false,
@@ -566,6 +567,13 @@ class AscendConfig:
     # ---- user-input switches: bool/int/list/str, auto type validation ----
     enable_cpu_binding: bool = True
     multistream_dsv4_dsa_overlap: bool = True
+    # Prepare Engram hashes, lookups and DP/TP exchanges on an auxiliary stream;
+    # FULL graphs wait on descriptor-specific external events at consumers.
+    # Default to overlap on A5 only; explicit settings override this policy.
+    multistream_engram_overlap: bool = dataclasses.field(
+        default_factory=lambda: get_current_hardware_profile().device_adaptor_family
+        == DeviceAdaptorFamily.FP8_OPTIMIZED
+    )
     enable_prefill_mc2: bool = False
     multistream_overlap_shared_expert: bool = False
     enable_kv_nz: bool = False
@@ -675,6 +683,16 @@ class AscendConfig:
     # the max_num_batched_tokens that sequence-parallel writeback corrected).
     def derive_and_validate(self, vllm_config: VllmConfig) -> AscendConfig:
         vc = vllm_config
+        engram_config = getattr(vc, "engram_config", None)
+        if (
+            engram_config is not None
+            and not engram_config.dp_shared_memory
+            and vc.use_v2_model_runner
+            and vc.parallel_config.data_parallel_size > 1
+        ):
+            # DP-dummy ranks have no hash work in MRV2. Share host tables so
+            # replicas do not require matching embedding collectives each step.
+            engram_config.dp_shared_memory = True
         if (
             self.enable_force_eplb
             and self.eplb_config.dynamic_eplb

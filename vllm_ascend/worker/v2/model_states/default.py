@@ -17,6 +17,8 @@
 # This file is a part of the vllm-ascend project.
 #
 
+from collections.abc import Callable
+from functools import partial
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -30,6 +32,7 @@ from vllm_ascend.worker.v2.attn_utils import build_attn_metadata, ring_state_upd
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch
 
 if TYPE_CHECKING:
+    from vllm_ascend.worker.device_metadata import TargetDeviceMetadata
     from vllm_ascend.worker.v2.kvpp import KVPPRuntime
     from vllm_ascend.worker.v2.pcp_manager import AscendPCPAttentionContext, AscendPCPManager
 
@@ -41,6 +44,12 @@ class AscendModelState(DefaultModelState):
     pcp_context: "AscendPCPAttentionContext | None" = None
     kvpp_runtime: "KVPPRuntime | None" = None
     kvpp_is_dummy_run: bool = False
+    device_metadata: "TargetDeviceMetadata | None" = None
+
+    def finish_execution(self, *, failed: bool) -> None:
+        """Join auxiliary metadata work even if input preparation failed."""
+        if self.device_metadata is not None:
+            self.device_metadata.finish()
 
     def _get_engram_device_inputs(self, input_batch: AscendInputBatch) -> dict[str, torch.Tensor]:
         """Device request coordinates for upstream NgramHashState."""
@@ -80,26 +89,32 @@ class AscendModelState(DefaultModelState):
 
     def prepare_inputs(self, input_batch, req_states) -> dict[str, Any]:
         model_inputs = super().prepare_inputs(input_batch, req_states)
+        model_inputs.update(self.prepare_engram_inputs(input_batch, req_states))
+        return model_inputs
+
+    def prepare_engram_inputs(self, input_batch, req_states) -> dict[str, Any]:
+        """Model-specific history providers override this single preparation hook."""
         prepare_engram_inputs = getattr(self.model, "prepare_engram_inputs", None)
         if prepare_engram_inputs is None:
-            return model_inputs
+            return {}
         num_tokens = input_batch.num_tokens_after_padding
-        model_inputs.update(
-            prepare_engram_inputs(
-                input_batch.input_ids[:num_tokens],
-                input_batch.positions[:num_tokens],
-                num_tokens,
-                **self._get_engram_device_inputs(input_batch),
-            )
+        return prepare_engram_inputs(
+            input_batch.input_ids[:num_tokens],
+            input_batch.positions[:num_tokens],
+            num_tokens,
+            **self._get_engram_device_inputs(input_batch),
         )
-        return model_inputs
 
     def prepare_dummy_inputs(self, num_reqs: int, num_tokens: int) -> dict[str, Any]:
         model_inputs = super().prepare_dummy_inputs(num_reqs, num_tokens)
+        model_inputs.update(self.prepare_engram_dummy_inputs(num_reqs, num_tokens))
+        return model_inputs
+
+    def prepare_engram_dummy_inputs(self, num_reqs: int, num_tokens: int) -> dict[str, Any]:
         prepare_engram_graph_inputs = getattr(self.model, "prepare_engram_graph_inputs", None)
         if prepare_engram_graph_inputs is not None:
-            model_inputs.update(prepare_engram_graph_inputs(num_tokens))
-        return model_inputs
+            return prepare_engram_graph_inputs(num_tokens)
+        return {}
 
     def prepare_attn(
         self,
@@ -158,7 +173,10 @@ class AscendModelState(DefaultModelState):
         self.slot_mappings = slot_mappings
         self.kv_cache_config = kv_cache_config
         self.pcp_context = pcp_context
-        self.attn_metadata = build_attn_metadata(
+        build_metadata: Callable[..., Any] = build_attn_metadata
+        if self.device_metadata is not None:
+            build_metadata = partial(self.device_metadata.run_build, build_attn_metadata)
+        self.attn_metadata = build_metadata(
             attn_groups=attn_groups,
             num_reqs=num_reqs,
             num_actual_reqs=num_actual_reqs,
