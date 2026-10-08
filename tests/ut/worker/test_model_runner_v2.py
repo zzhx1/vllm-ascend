@@ -21,7 +21,8 @@ from vllm_ascend.worker.v2.pcp_manager import AscendPCPManager
 def _make_runner(need_timing: bool = True):
     runner = NPUModelRunner.__new__(NPUModelRunner)
     runner.ascend_config = SimpleNamespace(
-        scheduler_config=SimpleNamespace(profiling_chunk_config=SimpleNamespace(need_timing=need_timing))
+        scheduler_config=SimpleNamespace(profiling_chunk_config=SimpleNamespace(need_timing=need_timing)),
+        sparse_kv_offload_config=SimpleNamespace(enabled=False),
     )
     runner.vllm_config = SimpleNamespace()
     runner.model_config = SimpleNamespace(hf_config=SimpleNamespace(model_type="other_model"))
@@ -43,11 +44,22 @@ def _make_runner(need_timing: bool = True):
     return runner
 
 
-@pytest.mark.parametrize("dummy", [False, True])
-@pytest.mark.parametrize("fail", [False, True])
-def test_metadata_and_dp_skip_scopes_coexist_and_retire(monkeypatch, dummy, fail):
+@pytest.mark.parametrize(
+    ("dummy", "profile", "fail"),
+    [
+        (False, False, False),
+        (False, False, True),
+        (True, False, False),
+        (True, False, True),
+        (False, True, False),
+        (False, True, True),
+    ],
+)
+def test_metadata_and_dp_skip_scopes_coexist_and_retire(monkeypatch, dummy, profile, fail):
     runner = _make_runner(need_timing=False)
+    scheduler_output = SimpleNamespace()
     active = set()
+    events: list[str | tuple[str, bool]] = []
 
     @contextmanager
     def scope(name):
@@ -61,10 +73,20 @@ def test_metadata_and_dp_skip_scopes_coexist_and_retire(monkeypatch, dummy, fail
     monkeypatch.setattr(module + "has_kv_transfer_group", lambda: False)
     monkeypatch.setattr(module + "should_skip_allreduce_across_dp_group", lambda _config: True)
     monkeypatch.setattr(module + "skip_dp_coordination", lambda: scope("dp_skip"))
+    runner.model_state.finish_execution.side_effect = lambda *, failed: events.append(("finish", failed))
+
+    def send_draft_kv(_output):
+        assert active == set()
+        events.append("draft")
+
+    draft_sender = Mock(side_effect=send_draft_kv)
+    monkeypatch.setattr(runner, "_maybe_send_draft_kv", draft_sender)
 
     def forward(_self, _output, **kwargs):
         assert active == {"dp_skip"}
         assert kwargs["dummy_run"] is dummy
+        assert kwargs["is_profile"] is profile
+        events.append("forward")
         if fail:
             raise ValueError("forward failed")
         return "output"
@@ -72,11 +94,19 @@ def test_metadata_and_dp_skip_scopes_coexist_and_retire(monkeypatch, dummy, fail
     monkeypatch.setattr(GPUModelRunner, "execute_model", forward)
     if fail:
         with pytest.raises(ValueError, match="forward failed"):
-            runner.execute_model(SimpleNamespace(), dummy_run=dummy)
+            runner.execute_model(scheduler_output, dummy_run=dummy, is_profile=profile)
     else:
-        assert runner.execute_model(SimpleNamespace(), dummy_run=dummy) == "output"
+        assert runner.execute_model(scheduler_output, dummy_run=dummy, is_profile=profile) == "output"
     assert active == set()
     runner.model_state.finish_execution.assert_called_once_with(failed=fail)
+
+    expected = ["forward", ("finish", fail)]
+    if not (fail or dummy or profile):
+        expected.append("draft")
+        draft_sender.assert_called_once_with(scheduler_output)
+    else:
+        draft_sender.assert_not_called()
+    assert events == expected
 
 
 def _make_batch_state(computed: list[int], scheduled: list[int], prefill_lens: list[int]) -> BatchReqState:
@@ -689,8 +719,11 @@ def test_initialize_kv_cache_installs_aclgraph_factory_and_pcp(a5, architecture)
     runner = _make_runner()
     runner.compilation_config = SimpleNamespace(static_forward_context={})
     runner.vllm_config = SimpleNamespace(
-        compilation_config=runner.compilation_config, scheduler_config=SimpleNamespace(max_num_seqs=8)
+        compilation_config=runner.compilation_config,
+        scheduler_config=SimpleNamespace(max_num_seqs=8),
+        kv_transfer_config=None,
     )
+    runner.max_num_reqs = runner.vllm_config.scheduler_config.max_num_seqs
     runner.pcp_manager = MagicMock(spec=AscendPCPManager)
     runner.model_state = SimpleNamespace(pcp_manager=None, kvpp_runtime=None)
     runner.speculator = SimpleNamespace()
@@ -713,7 +746,8 @@ def test_initialize_kv_cache_installs_aclgraph_factory_and_pcp(a5, architecture)
 
     def _prepare_kda(context, maximum):
         """Check that the parent bound cache before the startup hook runs."""
-        assert runner.kv_cache_config is kv_cache_config
+        assert runner.kv_cache_config == kv_cache_config
+        assert runner.kv_cache_config is not kv_cache_config
         assert context is runner.compilation_config.static_forward_context
         assert maximum == 8
 
@@ -737,6 +771,7 @@ def test_initialize_kv_cache_installs_aclgraph_factory_and_pcp(a5, architecture)
     )
     assert metadata_cls.call_count == int(a5 and architecture == "DeepseekV41ForCausalLM")
     assert seen["cfg"] == kv_cache_config
+    assert seen["cfg"] is not kv_cache_config
     assert vllm_model_runner.ModelCudaGraphManager is original
     acl_cls.assert_called_once()
     create_kvpp.assert_called_once()
@@ -753,8 +788,11 @@ def test_initialize_kv_cache_forwards_allocation_context():
     runner = _make_runner()
     runner.compilation_config = SimpleNamespace(static_forward_context={})
     runner.vllm_config = SimpleNamespace(
-        compilation_config=runner.compilation_config, scheduler_config=SimpleNamespace(max_num_seqs=8)
+        compilation_config=runner.compilation_config,
+        scheduler_config=SimpleNamespace(max_num_seqs=8),
+        kv_transfer_config=None,
     )
+    runner.max_num_reqs = runner.vllm_config.scheduler_config.max_num_seqs
     runner.pcp_manager = None
     runner.model_state = SimpleNamespace(pcp_manager=None, kvpp_runtime=None)
     runner.speculator = None
@@ -777,7 +815,8 @@ def test_initialize_kv_cache_forwards_allocation_context():
 
     def _prepare_kda(context, maximum):
         """Check cache binding and configuration at the startup boundary."""
-        assert runner.kv_cache_config is kv_cache_config
+        assert runner.kv_cache_config == kv_cache_config
+        assert runner.kv_cache_config is not kv_cache_config
         assert context is runner.compilation_config.static_forward_context
         assert maximum == 8
 
@@ -827,6 +866,55 @@ def test_profile_run_skips_mc2_dummy_without_capacity():
     ):
         runner.profile_run()
     runner._dummy_run.assert_not_called()
+
+
+def test_profile_run_reserves_sparse_offload_topk_buffers():
+    runner = _make_runner()
+    sparse_cfg = SimpleNamespace(enabled=True)
+    runner.ascend_config.sparse_kv_offload_config = sparse_cfg
+    runner.get_kv_cache_spec = MagicMock(return_value={"layer.0": "host-spec"})
+    with (
+        patch("vllm_ascend.worker.v2.model_runner.allocate_kv_offload_topk_profile_buffers") as reserve,
+        patch("vllm_ascend.worker.v2.model_runner.get_mc2_tokens_capacity", return_value=None),
+        patch("vllm_ascend.worker.v2.model_runner.override_mrv2_in_profile_run", return_value=nullcontext()),
+        patch.object(GPUModelRunner, "profile_run"),
+    ):
+        runner.profile_run()
+
+    reserve.assert_called_once_with({"layer.0": "host-spec"}, runner.vllm_config, sparse_cfg)
+
+
+def test_register_sparse_kv_caches_binds_fused_target_and_draft_layers():
+    class FakeSFAOffloadImpl:
+        def __init__(self, shared, skip_topk):
+            self.topk_indices_buffer = shared
+            self.skip_topk = skip_topk
+            self.lim_indexer_owner = None
+            self.bind_copy_sfa_kv_cache = MagicMock()
+
+    runner = _make_runner()
+    manager = MagicMock()
+    manager.offload_layer_names = ["target.layer", "draft.layer"]
+    runner.sparse_kv_offload_manager = manager
+    runner.ascend_config.sparse_kv_offload_config.use_fused_copy_sfa = True
+    shared = torch.zeros(1, dtype=torch.int32)
+    owner = FakeSFAOffloadImpl(shared, False)
+    follower = FakeSFAOffloadImpl(shared, True)
+    runner.compilation_config = SimpleNamespace(
+        static_forward_context={
+            "target.layer": SimpleNamespace(impl=owner),
+            "draft.layer": SimpleNamespace(impl=follower),
+        }
+    )
+    caches = {"target.layer": object(), "draft.layer": object()}
+
+    with patch("vllm_ascend.attention.sfa_kv_offload.AscendSFAKVOffloadImpl", FakeSFAOffloadImpl):
+        runner._register_sparse_kv_caches(caches)
+
+    manager.register_kv_caches.assert_called_once_with(caches)
+    assert follower.lim_indexer_owner is owner
+    owner.bind_copy_sfa_kv_cache.assert_called_once_with(manager, "target.layer")
+    follower.bind_copy_sfa_kv_cache.assert_called_once_with(manager, "draft.layer")
 
 
 @pytest.mark.parametrize(("query_width", "expected_reqs"), [(7, 4), (None, 32)])

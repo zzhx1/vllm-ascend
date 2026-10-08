@@ -1747,22 +1747,15 @@ class SparseKVOffloadConfig:
                     "and can only be used in D node. For debugging in PD colocate scenario, "
                     "you can enable keep_device_kv_cache."
                 )
-        if vllm_config.use_v2_model_runner:
-            raise ValueError("Sparse KV offload doesn't support model_runner_v2 now.")
-
         self.topk = vllm_config.model_config.hf_text_config.index_topk
-        if self.use_fused_copy_sfa:
-            if vllm_config.speculative_config and vllm_config.speculative_config.method == "dspark":
-                raise ValueError("fused_copy_sfa does not support DSpark speculative decoding")
-            width = 1 + (vllm_config.speculative_config.num_speculative_tokens if vllm_config.speculative_config else 0)
-            if self.topk != 2048 or not 1 <= width <= 7:
-                raise ValueError("fused_copy_sfa serving requires TopK=2048 and 1–7 query rows per request")
-            if not width * self.topk <= self.topk_buffer_size <= 16256 or self.topk_buffer_size % 256:
-                raise ValueError(
-                    "fused_copy_sfa hot budget must be 256-aligned in [Q_max*2048, 16128]: "
-                    "the dense short-sequence layout only lines up with the circular "
-                    "tail slots when topk_buffer_size is a multiple of 256"
-                )
+        speculative = getattr(vllm_config, "speculative_config", None)
+        if (
+            speculative is not None
+            and speculative.method == "dspark"
+            and not getattr(vllm_config, "use_v2_model_runner", False)
+        ):
+            # Only V2 initializes the resident draft KV from remote prompt context.
+            raise ValueError("Sparse KV offload with DSpark requires V2 remote prompt-context initialization")
         if self.topk_buffer_size < self.topk:
             raise ValueError(
                 "sparse_kv_offload_config.topk_buffer_size must be >= topk, "

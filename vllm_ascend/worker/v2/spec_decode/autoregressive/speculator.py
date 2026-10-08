@@ -38,6 +38,7 @@ from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.gpu.spec_decode.autoregressive.speculator import AutoRegressiveSpeculator
 from vllm.v1.worker.utils import AttentionGroup
 
+from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAttentionState
 from vllm_ascend.attention.context_parallel.attention_cp import build_dcp_fia_params
 from vllm_ascend.attention.context_parallel.common_cp import CPKVScope
@@ -53,6 +54,7 @@ from vllm_ascend.worker.v2.attn_utils import (
 )
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers
 from vllm_ascend.worker.v2.pcp_manager import AscendPCPManager
+from vllm_ascend.worker.v2.spec_decode.autoregressive.sparse_kv_offload import SparseKVOffloadMetadata
 from vllm_ascend.worker.v2.spec_decode.lmhead_tp_utils import LmheadTPDraftSamplingMixin
 from vllm_ascend.worker.v2.spec_decode.pcp_utils import (
     disable_profiling_chunk_for_draft,
@@ -118,6 +120,13 @@ class AscendAutoRegressiveSpeculator(LmheadTPDraftSamplingMixin, AutoRegressiveS
         # draft model's input_batch. so we keep a reference here.
         self.input_batch: InputBatch | None = None
         self.pcp_manager: AscendPCPManager | None = None
+        self._sparse_kv_offload_metadata = SparseKVOffloadMetadata(
+            enabled=get_ascend_config().sparse_kv_offload_config.enabled,
+            num_steps=self.num_speculative_steps,
+            max_num_reqs=self.max_num_reqs,
+            max_num_tokens=self.max_num_tokens,
+            device=device,
+        )
 
     def _init_dcp(self) -> None:
         self.use_dcp = self.draft_vllm_config.parallel_config.decode_context_parallel_size > 1
@@ -545,12 +554,16 @@ class AscendAutoRegressiveSpeculator(LmheadTPDraftSamplingMixin, AutoRegressiveS
 
         # Upstream's uniform builder calls self._build_attn_metadata, so this
         # single hook also covers graph capture and eager draft decode.
+        offload_kwargs = self._sparse_kv_offload_metadata.build_kwargs(
+            self.input_batch, self.model_state, num_reqs, batch_desc, query_start_loc_np, step
+        )
         with build_attn_metadata_factory(
             self.input_buffers.positions,
             batch_desc.num_tokens,
             is_prefilling,
             seq_lens_cpu=seq_lens_cpu,
             parallel_config=self.draft_vllm_config.parallel_config,
+            offload_kwargs=offload_kwargs,
         ):
             attn_metadata = super()._build_attn_metadata(
                 num_reqs,
