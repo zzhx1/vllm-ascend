@@ -30,6 +30,7 @@ from vllm_ascend.attention.attention_v1 import (
     AscendC8AttentionBackendImpl,
 )
 from vllm_ascend.attention.context_parallel.attention_cp import AscendAttentionDCPImpl
+from vllm_ascend.attention.context_parallel.dsa_cp import AscendDSACPMetadataBuilder
 from vllm_ascend.attention.dsa_v1 import (
     AscendDSAC4Backend,
     AscendDSAC4StateBackend,
@@ -866,7 +867,21 @@ class _RecordingDSAMetadataBuilder(AscendDSAMetadataBuilder):
         return SimpleNamespace(common_attn_metadata=common_attn_metadata)
 
 
-def _make_dsa_metadata_groups():
+class _RecordingDSACPMetadataBuilder(AscendDSACPMetadataBuilder):
+    def __init__(self, calls: list[dict[str, Any]], compressor_ratio: int):
+        self.calls = calls
+        self.for_cudagraph_capture = False
+        self.tq_group_block_sizes = None
+        self.compressor_ratio = compressor_ratio
+
+    build = _RecordingDSAMetadataBuilder.build
+
+    def build_for_cudagraph_capture(self, common_attn_metadata, **kwargs):
+        self.for_cudagraph_capture = True
+        return self.build(common_prefix_len=0, common_attn_metadata=common_attn_metadata, **kwargs)
+
+
+def _make_dsa_metadata_groups(builder_cls=_RecordingDSAMetadataBuilder):
     layer_names = [
         "model.layers.0.self_attn.compressor",
         "model.layers.0.self_attn.indexer",
@@ -883,7 +898,7 @@ def _make_dsa_metadata_groups():
                 layer_names=[layer_name],
                 kv_cache_spec=spec,
                 kv_cache_group_id=group_id,
-                metadata_builders=[_RecordingDSAMetadataBuilder(calls, _spec_compress_ratio(spec))],
+                metadata_builders=[builder_cls(calls, _spec_compress_ratio(spec))],
             )
         ]
         for group_id, (layer_name, spec) in enumerate(zip(layer_names, specs))
@@ -1119,6 +1134,7 @@ def test_dsv4_backends_declare_role_specific_logical_sizes(
         ("pcp_runtime", CUDAGraphMode.NONE, False, 2, 8),
     ],
 )
+@pytest.mark.parametrize("builder_cls", [_RecordingDSAMetadataBuilder, _RecordingDSACPMetadataBuilder])
 def test_mrv2_builds_shared_dsa_metadata_for_each_execution_mode(
     monkeypatch,
     caller,
@@ -1126,6 +1142,7 @@ def test_mrv2_builds_shared_dsa_metadata_for_each_execution_mode(
     for_capture,
     pcp_size,
     expected_input_tokens,
+    builder_cls,
 ):
     parallel_config = SimpleNamespace(
         prefill_context_parallel_size=pcp_size,
@@ -1133,7 +1150,7 @@ def test_mrv2_builds_shared_dsa_metadata_for_each_execution_mode(
         cp_kv_cache_interleave_size=2,
     )
     monkeypatch.setattr(attn_utils, "get_dcp_group", lambda: SimpleNamespace(rank_in_group=0))
-    layer_names, specs, calls, attn_groups, kv_cache_config = _make_dsa_metadata_groups()
+    layer_names, specs, calls, attn_groups, kv_cache_config = _make_dsa_metadata_groups(builder_cls)
     block_tables = (
         torch.zeros((4, 1), dtype=torch.int32),
         torch.zeros((4, 1), dtype=torch.int32),
