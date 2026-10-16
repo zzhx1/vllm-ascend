@@ -1010,6 +1010,10 @@ class KVPoolWorker:
 
         layer_cache_entry_offsets = [0]
         for phys in sorted(layer_names_by_physical):
+            if getattr(self, "use_kvpp", False):
+                self.physical_layer_to_group_layers.setdefault(phys, []).append(
+                    (group_id, len(layer_cache_entry_offsets) - 1)
+                )
             for layer_name in sorted(layer_names_by_physical[phys]):
                 cache_or_caches = self.kv_caches[layer_name]
                 for cache in self._as_cache_tuple(cache_or_caches):
@@ -1126,6 +1130,7 @@ class KVPoolWorker:
         self.group_layer_cache_entry_offsets: dict[int, list[int]] = {}
         self.kv_caches = kv_caches
         if self.use_kvpp:
+            self.physical_layer_to_group_layers.clear()
             owners = map_kvpp_layers_to_owners(self.vllm_config, kv_caches.keys())
             kv_caches = {
                 name: caches for name, caches in kv_caches.items() if owners.get(name) in (None, self.kvpp_rank)
@@ -2182,10 +2187,12 @@ class KVPoolWorker:
         if self.use_block_key_layerwise:
             # The map and buffer builders both use stage-local physical layer
             # indices. A group's dense layer index is a third, distinct axis.
-            if self.num_kv_cache_groups == 1:
+            if self.num_kv_cache_groups == 1 and not getattr(self, "use_kvpp", False):
                 return [(0, local_layer)]
             groups = self.physical_layer_to_group_layers.get(local_layer)
             if groups is None:
+                if getattr(self, "use_kvpp", False):
+                    return []
                 raise RuntimeError(f"Mooncake layerwise: no KV cache group for local layer {local_layer}")
             return [(group_id, layer_idx) for group_id, layer_idx in groups if group_id in self.cacheable_group_ids]
         # GVA groups use stage-local indices too; PP offsets apply to pool keys and remote addresses.
@@ -2834,15 +2841,11 @@ class KVPoolWorker:
             )
             return True
 
-        submit_count = self.num_prefetch_layers if self.current_layer == 0 else 1
-        if getattr(self, "block_key_hybrid", False):
-            submit_count = max(0, self.current_layer + self.num_prefetch_layers + 1 - self.next_layer_to_submit)
-        submitted_layers = 0
-        while submitted_layers < submit_count and self.next_layer_to_submit < self.num_layers:
+        window_end = min(self.current_layer + self.num_prefetch_layers, self.num_layers - 1)
+        while self.next_layer_to_submit <= window_end:
             layer_id = self.next_layer_to_submit
             self.next_layer_to_submit += 1
-            if submit_layer_load(layer_id):
-                submitted_layers += 1
+            submit_layer_load(layer_id)
 
     def wait_for_layer_load(self) -> None:
         if self.current_layer >= self.num_layers:
