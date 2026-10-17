@@ -18,6 +18,7 @@ from vllm.distributed import (
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    get_tp_group,
 )
 from vllm.distributed.kv_events import BlockStored
 from vllm.logger import logger
@@ -1239,6 +1240,11 @@ class KVPoolWorker:
         """Prepare per-step hook state when the runner binds metadata."""
         assert self.use_layerwise
         self._drain_deferred_last_save()
+        # The final-layer fence drains this rank only. Readers of replicated
+        # KV must also wait for the writer before querying the previous step.
+        # Use configuration, never local requests/tasks, to gate the collective.
+        if self.use_layerwise_transfer and self.layerwise_offload and self.tp_size > 1:
+            get_tp_group().barrier()
         self.current_layer = 0
         self.layerwise_retrievers: list[Any] = []
         self.next_layer_to_submit = 0
@@ -1473,7 +1479,6 @@ class KVPoolWorker:
             if request.can_save is None or not request.can_save:
                 continue
             save_start_block = request.save_start_token // block_size
-            save_end_block = request.save_end_token // block_size
             group_block_hashes = get_block_hashes(
                 request.block_hashes,
                 block_size,
@@ -1485,10 +1490,14 @@ class KVPoolWorker:
                 len(group_block_hashes),
                 self.layerwise_offload,
             )
-            # Skip blocks that are hit in the KV pool — their KV is already
-            # in the pool (loaded via load_prepare), so re-saving would write
-            # to a READABLE blob and fail with MMC_UNMATCHED_KEY.
-            if request.load_spec is not None and request.load_spec.can_load:
+            save_end_block = self._layerwise_save_full_end(request, group_id, block_size, partial_block_index)
+            # External hits already have full keys. A previous-step hit may
+            # instead use snapshots, which still need promotion to full keys.
+            if (
+                request.load_spec is not None
+                and request.load_spec.can_load
+                and not request.load_spec.layerwise_previous_step
+            ):
                 pool_hit_tokens = (
                     request.load_spec.kvpool_store_skip_tokens
                     if request.load_spec.kvpool_store_skip_tokens is not None
@@ -1595,11 +1604,14 @@ class KVPoolWorker:
             )
             cached_full_blocks = cached_tokens // block_size
             full_blocks = min(cached_full_blocks, len(group_block_hashes))
-            partial_block_index = get_partial_block_index(
+            if self._layerwise_load_snapshot_start(request, group_id, cached_tokens) is not None:
+                full_blocks = cached_full_blocks
+            partial_block_index, _ = self._resolve_layerwise_load_partial(
+                request,
+                group_id,
                 cached_tokens,
                 block_size,
                 len(group_block_hashes),
-                self.layerwise_offload,
             )
             if not self.layerwise_offload or layer_id in self.independent_layers:
                 partial_block_index = None
@@ -1620,6 +1632,20 @@ class KVPoolWorker:
             block_runs = self._masked_block_runs_cached(
                 "load", request, group_id, load_start_block, full_blocks, group_load_mask
             )
+            # A preserved partial snapshot may now sit on a hash boundary
+            # after speculative rollback.  It must be transferred exactly
+            # once through the partial GVA, not also as a full-key block.
+            if partial_block_index is not None and partial_block_index < full_blocks:
+                split_runs = []
+                for run_start, run_end in block_runs:
+                    if partial_block_index < run_start or partial_block_index >= run_end:
+                        split_runs.append((run_start, run_end))
+                        continue
+                    if run_start < partial_block_index:
+                        split_runs.append((run_start, partial_block_index))
+                    if partial_block_index + 1 < run_end:
+                        split_runs.append((partial_block_index + 1, run_end))
+                block_runs = split_runs
             if not block_runs and partial_block_index is None:
                 continue
             for run_idx, (run_start_block, run_end_block) in enumerate(block_runs):
@@ -1662,6 +1688,89 @@ class KVPoolWorker:
         return self.layerwise_keys.make_full_key(
             group_id, block_hash_hex, self.metadata[group_id].head_or_tp_rank, self.pp_rank
         )
+
+    def _resolve_layerwise_load_partial(
+        self,
+        request: ReqMeta,
+        group_id: int,
+        cached_tokens: int,
+        block_size: int,
+        hash_count: int,
+    ) -> tuple[int | None, int]:
+        """Resolve the block and key length of a layerwise partial load.
+
+        Speculative rejection may roll ``cached_tokens`` back after the prior
+        step saved a longer request-scoped snapshot.  Reuse that exact saved
+        identity when it still covers the logical prefix. A snapshot can
+        include unhashed full blocks as well as its tail; rollback can land
+        in any of those blocks. The override is limited to the current
+        single-group, non-align-state path; hybrid/Mamba layouts keep their
+        existing behavior.
+        """
+        partial_block_index = get_partial_block_index(
+            cached_tokens,
+            block_size,
+            hash_count,
+            self.layerwise_offload,
+        )
+        partial_end_token = cached_tokens
+        load_spec = request.load_spec
+        if load_spec is None or self.num_kv_cache_groups != 1 or group_id != 0 or self.group_uses_align_state[group_id]:
+            return partial_block_index, partial_end_token
+
+        snapshot_end_token = load_spec.layerwise_snapshot_end_token
+        snapshot_start = self._layerwise_load_snapshot_start(request, group_id, cached_tokens)
+        if snapshot_start is None:
+            return partial_block_index, partial_end_token
+
+        assert snapshot_end_token is not None
+        logical_last_block = (cached_tokens - 1) // block_size
+        if snapshot_start <= logical_last_block:
+            logger.debug(
+                "Reqid: %s reusing layerwise snapshot block=%d end_token=%d for logical length=%d",
+                request.req_id,
+                logical_last_block,
+                snapshot_end_token,
+                cached_tokens,
+            )
+            return logical_last_block, snapshot_end_token
+        return partial_block_index, partial_end_token
+
+    def _layerwise_load_snapshot_start(self, request: ReqMeta, group_id: int, cached_tokens: int) -> int | None:
+        """Use the preceding save's key namespace, not this step's hash availability."""
+        spec = request.load_spec
+        if (
+            not self.layerwise_offload
+            or self.num_kv_cache_groups != 1
+            or group_id != 0
+            or self.group_uses_align_state[group_id]
+            or spec is None
+            or cached_tokens <= 0
+            or spec.layerwise_snapshot_end_token is None
+            or spec.layerwise_snapshot_end_token < cached_tokens
+        ):
+            return None
+        return (
+            spec.layerwise_snapshot_start_block
+            if spec.layerwise_snapshot_start_block is not None
+            else spec.layerwise_snapshot_block_index
+        )
+
+    def _layerwise_save_full_end(
+        self, request: ReqMeta, group_id: int, block_size: int, partial_block_index: int | None
+    ) -> int:
+        """Unhashed full blocks use normal GVA slots; the tail keeps its partial slot."""
+        end = request.save_end_token // block_size
+        if (
+            self.use_layerwise_transfer
+            and self.layerwise_offload
+            and self.num_kv_cache_groups == 1
+            and not self.group_uses_align_state[group_id]
+        ):
+            end = request.target_token_len // block_size
+            if partial_block_index is not None:
+                end = min(end, partial_block_index)
+        return end
 
     def _make_layerwise_partial_key(
         self,
@@ -1760,8 +1869,17 @@ class KVPoolWorker:
                 group_block_hashes = get_block_hashes(block_hashes, effective_block_size, self.hash_block_size)
 
                 save_start_block = request.save_start_token // effective_block_size
-                save_end_block = request.save_end_token // effective_block_size
-                if request.load_spec is not None and request.load_spec.can_load:
+                partial_block_index = get_partial_block_index(
+                    request.target_token_len, effective_block_size, len(group_block_hashes), self.layerwise_offload
+                )
+                save_end_block = self._layerwise_save_full_end(
+                    request, group_id, effective_block_size, partial_block_index
+                )
+                if (
+                    request.load_spec is not None
+                    and request.load_spec.can_load
+                    and not request.load_spec.layerwise_previous_step
+                ):
                     pool_hit_tokens = (
                         request.load_spec.kvpool_store_skip_tokens
                         if request.load_spec.kvpool_store_skip_tokens is not None
@@ -1774,7 +1892,13 @@ class KVPoolWorker:
                     if request.store_masks is not None and group_id < len(request.store_masks)
                     else None
                 )
-                end_limit = min(save_end_block, len(group_block_hashes))
+                end_limit = min(save_end_block, len(block_ids_by_group))
+                if not (
+                    self.layerwise_offload
+                    and self.num_kv_cache_groups == 1
+                    and not self.group_uses_align_state[group_id]
+                ):
+                    end_limit = min(end_limit, len(group_block_hashes))
                 candidate_blocks = [
                     block_idx
                     for block_idx in range(save_start_block, end_limit)
@@ -1785,6 +1909,8 @@ class KVPoolWorker:
                         group_id,
                         block_hash_to_str(group_block_hashes[block_idx]),
                     )
+                    if block_idx < len(group_block_hashes)
+                    else self._make_layerwise_partial_key(request, group_id, block_idx, request.target_token_len)
                     for block_idx in candidate_blocks
                 ]
                 # Skip blocks already committed in the pool. The exists check
@@ -1802,10 +1928,7 @@ class KVPoolWorker:
                 # cross-step GVA cache is kept.
                 block_gvas: list[int] = []
                 if transfer_blocks:
-                    transfer_keys = [
-                        self._make_layerwise_full_key(group_id, block_hash_to_str(group_block_hashes[blk_idx]))
-                        for blk_idx in transfer_blocks
-                    ]
+                    transfer_keys = [key for key in candidate_keys if key in missing_keys]
                     transfer_gvas = self.m_store.batch_alloc(
                         transfer_keys, [alloc_size] * len(transfer_keys), LAYERWISE_READ_LEASE_TTL_MS
                     )
@@ -1943,6 +2066,9 @@ class KVPoolWorker:
                 )
                 cached_full_blocks = cached_tokens // effective_block_size
                 full_blocks = min(cached_full_blocks, len(group_block_hashes))
+                snapshot_start = self._layerwise_load_snapshot_start(request, group_id, cached_tokens)
+                if snapshot_start is not None:
+                    full_blocks = cached_full_blocks
 
                 block_ids_by_group = (
                     request.block_ids_by_group_np[group_id]
@@ -1954,11 +2080,12 @@ class KVPoolWorker:
                     continue
                 full_len = len(block_ids_by_group)
 
-                partial_block_index = get_partial_block_index(
+                partial_block_index, partial_end_token = self._resolve_layerwise_load_partial(
+                    request,
+                    group_id,
                     cached_tokens,
                     effective_block_size,
                     len(group_block_hashes),
-                    self.layerwise_offload,
                 )
                 if partial_block_index is not None and (
                     partial_block_index < load_start_block or partial_block_index >= full_len
@@ -1977,12 +2104,18 @@ class KVPoolWorker:
                 block_indices = [
                     block_idx
                     for block_idx in range(load_start_block, full_blocks)
-                    if group_load_mask is None or block_idx >= len(group_load_mask) or group_load_mask[block_idx]
+                    if block_idx != partial_block_index
+                    and (group_load_mask is None or block_idx >= len(group_load_mask) or group_load_mask[block_idx])
                 ]
-                keys = [
-                    self._make_layerwise_full_key(group_id, block_hash_to_str(group_block_hashes[block_idx]))
-                    for block_idx in block_indices
-                ]
+                keys = []
+                for block_idx in block_indices:
+                    if snapshot_start is None or block_idx < snapshot_start:
+                        key = self._make_layerwise_full_key(group_id, block_hash_to_str(group_block_hashes[block_idx]))
+                    else:
+                        snapshot_end_token = request.load_spec.layerwise_snapshot_end_token
+                        assert snapshot_end_token is not None
+                        key = self._make_layerwise_partial_key(request, group_id, block_idx, snapshot_end_token)
+                    keys.append(key)
                 has_partial_key = False
                 if partial_block_index is not None:
                     keys.append(
@@ -1990,7 +2123,7 @@ class KVPoolWorker:
                             request,
                             group_id,
                             partial_block_index,
-                            cached_tokens,
+                            partial_end_token,
                         )
                     )
                     block_indices.append(partial_block_index)
