@@ -478,6 +478,21 @@ class TestAscendConfig(TestBase):
 
     @_clean_up_ascend_config
     @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    def test_enable_force_eplb_logs_production_warning(self, mock_fix_incompatible_config):
+        test_vllm_config = VllmConfig()
+        test_vllm_config.additional_config = {"enable_force_eplb": True}
+        with patch("vllm_ascend.ascend_config.logger") as mock_logger:
+            ascend_config = init_ascend_config(test_vllm_config)
+
+        self.assertTrue(ascend_config.enable_force_eplb)
+        warnings = [str(call.args[0]) for call in mock_logger.warning.call_args_list]
+        self.assertTrue(
+            any("must not be used in production" in message for message in warnings),
+            f"expected a production warning, got {warnings}",
+        )
+
+    @_clean_up_ascend_config
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
     def test_init_ascend_config_validates_mega_moe_max_tokens(self, mock_fix_incompatible_config):
         # NOTE: pydantic coerces numeric strings (e.g. "65536") to int, so only
         # out-of-range values are invalid on main.

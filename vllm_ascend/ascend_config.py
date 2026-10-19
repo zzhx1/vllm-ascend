@@ -691,6 +691,14 @@ class AscendConfig:
             # DP-dummy ranks have no hash work in MRV2. Share host tables
             # across DP and PCP peers to avoid per-step lookup collectives.
             engram_config.dp_shared_memory = True
+        if self.enable_force_eplb:
+            logger.warning(
+                "enable_force_eplb is enabled: it forces a deterministic round-robin "
+                "expert routing that replaces the real MoE router output. The model "
+                "results and accuracy are therefore invalid. This is an analysis-only "
+                "switch for measuring the EPLB performance ceiling and must not be "
+                "used in production."
+            )
         if (
             self.enable_force_eplb
             and self.eplb_config.dynamic_eplb
