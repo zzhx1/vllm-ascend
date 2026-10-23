@@ -546,6 +546,8 @@ def build_attn_metadata(
             copy_sfa_restore_tails=copy_sfa_restore_tails,
             dcp_local_seq_lens=dcp_local_seq_lens,
             dcp_local_seq_lens_cpu=dcp_local_seq_lens_cpu,
+            pcp_context=pcp_context,
+            pcp_cache_group_idx=i if pcp_context is not None else None,
             **common_attn_metadata_extra_kwargs,
         )
         if common_metadata_callback is not None:
@@ -567,7 +569,6 @@ def build_attn_metadata(
                     metadata_variants = ([(target_names, common_attn_metadata)] if target_names else []) + [
                         (draft_names, draft_common)
                     ]
-            consumes_pcp_context = bool(getattr(attn_metadata_builder, "consumes_pcp_context", False))
             attn_metadata_extra_kwargs = (
                 model_specific_attn_metadata.get_extra_attn_kwargs(
                     attn_metadata_builder,
@@ -598,13 +599,6 @@ def build_attn_metadata(
                     # NONE and for_cudagraph_capture=True. Keep V4.1 indexer
                     # branches in the graph even for a short dummy sequence.
                     full_graph_mode=full_graph_mode or for_cudagraph_capture,
-                )
-            # Parallel attention and cache-only backends opt in to the PCP
-            # context needed to construct their own metadata.
-            if pcp_context is not None and (is_sfa_builder or is_dsa_builder or consumes_pcp_context):
-                attn_metadata_extra_kwargs.update(
-                    pcp_context=pcp_context,
-                    pcp_cache_group_idx=i,
                 )
 
             for variant_names, variant_common in metadata_variants:
