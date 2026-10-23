@@ -929,6 +929,13 @@ def test_v2_zeroer_skips_static_v_scale_for_mxfp8(monkeypatch):
             return launch
 
     monkeypatch.setattr("vllm.v1.worker.utils._zero_kv_blocks_kernel", _CpuZeroKernel())
+    if not vllm_version_is("0.31.0"):
+        # vLLM #60766 made async_tensor_h2d resolve pin memory lazily through
+        # is_pin_memory_available(). The NPU platform advertises pinned-memory
+        # support, so this CPU runner would allocate a PrivateUse1-pinned tensor
+        # and fail. The release lane captures PIN_MEMORY at import (False here),
+        # so only the main lane needs the resolver disabled.
+        monkeypatch.setattr("vllm.utils.torch_utils.is_pin_memory_available", lambda: False)
     zeroer.zero_block_ids([0])
 
     # Block 0 payload: k, k_scale and v are cleared, v_scale is preserved.
@@ -1125,6 +1132,54 @@ def test_gqa_pcp_dcp_cache_keeps_tp_local_kv_heads(monkeypatch, dcp_size):
     specs = attn_utils.get_kv_cache_spec(vllm_config)
 
     assert specs["model.layers.0.self_attn.attn"].num_kv_heads == 1
+
+
+@pytest.mark.parametrize("is_draft_layer", [True, False])
+def test_draft_layer_specs_are_tagged_for_eagle_groups(monkeypatch, is_draft_layer):
+    """Draft specs carry ``is_draft`` so EAGLE groups get flagged on main.
+
+    vLLM #42309 annotates ``is_eagle_group`` from ``spec.is_draft``; without the
+    tag no group is recognised as the draft model's and the coordinator
+    fallback flags every target group as an EAGLE group.
+    """
+    source_spec = FullAttentionSpec(
+        block_size=128,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.bfloat16,
+    )
+    if not hasattr(source_spec, "is_draft"):
+        pytest.skip("vLLM release lane has no KVCacheSpec.is_draft")
+    layer = SimpleNamespace(
+        kv_sharing_target_layer_name=None,
+        align_kv_cache_with_mamba=True,
+        is_draft_layer=is_draft_layer,
+        get_kv_cache_spec=lambda _config: source_spec,
+    )
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            use_mla=False,
+            dtype=torch.bfloat16,
+            get_total_num_kv_heads=lambda: 4,
+        ),
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=1,
+            prefill_context_parallel_size=1,
+            decode_context_parallel_size=1,
+        ),
+        attention_config=SimpleNamespace(indexer_kv_dtype="auto"),
+        cache_config=SimpleNamespace(cache_dtype="auto", block_size=128),
+    )
+    monkeypatch.setattr(
+        attn_utils,
+        "get_layers_from_vllm_config",
+        lambda *_args, **_kwargs: {"model.layers.0.self_attn.attn": layer},
+    )
+    monkeypatch.setattr(attn_utils, "enable_sfa_dcp_replicated_indexer", lambda _config: False)
+
+    spec = attn_utils.get_kv_cache_spec(vllm_config)["model.layers.0.self_attn.attn"]
+
+    assert spec.is_draft is is_draft_layer
 
 
 @pytest.mark.parametrize(
