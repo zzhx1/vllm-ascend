@@ -609,6 +609,9 @@ class KVPoolScheduler:
             the number of tokens that can be loaded from the
             external KV cache beyond what is already computed.
         """
+        # A waiting request can be looked up again before it is admitted.
+        # Never retain a load plan from an earlier hit across a miss/early return.
+        self.load_specs.pop(request.request_id, None)
         if self.kv_role == "kv_consumer" and not self.consumer_is_to_load:
             return 0, False
 

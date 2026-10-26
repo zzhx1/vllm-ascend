@@ -1683,3 +1683,75 @@ class TestKVPoolSchedulerLayerwiseReachableLookup(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@pytest.mark.parametrize("second_hit", [0, 768])
+def test_layerwise_retry_discards_stale_load_spec(second_hit):
+    scheduler = KVPoolScheduler(make_config(block_size=768, extra_config={"backend": "memcache"}), use_layerwise=True)
+    scheduler._get_layerwise_hit_tokens = MagicMock(side_effect=[12288, second_hit])
+    request = SimpleNamespace(
+        request_id="retry", prompt_token_ids=list(range(19000)), num_tokens=19000, block_hashes=[b"h"] * 25
+    )
+    assert scheduler.get_num_new_matched_tokens(request, 768) == (11520, False)
+    previous = scheduler.load_specs[request.request_id]
+    assert scheduler.get_num_new_matched_tokens(request, 0 if second_hit == 0 else 768) == (0, False)
+    if second_hit == 0:
+        assert request.request_id not in scheduler.load_specs
+    else:
+        assert scheduler.load_specs[request.request_id] is not previous
+        assert scheduler.load_specs[request.request_id].kvpool_cached_tokens == 768
+
+    scheduler.update_state_after_alloc(request, MagicMock(), 0)
+    scheduler._build_req_meta = MagicMock()
+    scheduled = SimpleNamespace(
+        req_id=request.request_id,
+        num_computed_tokens=0,
+        block_ids=[list(range(1, 9))],
+        prompt_token_ids=request.prompt_token_ids,
+        prefill_token_ids=None,
+    )
+    scheduler._process_new_request(scheduled, SimpleNamespace(num_scheduled_tokens={request.request_id: 5376}), False)
+    load_spec = scheduler._build_req_meta.call_args.args[2]
+    assert load_spec is None or load_spec.kvpool_cached_tokens <= 768
+
+
+@pytest.mark.parametrize("early_return", ["consumer", "short_prompt", "local_hit"])
+def test_lookup_early_return_discards_stale_load_spec(early_return):
+    scheduler = KVPoolScheduler(make_config(), use_layerwise=False)
+    scheduler.load_specs["retry"] = LoadSpec(768, 12288, True)
+    request = SimpleNamespace(request_id="retry", prompt_token_ids=list(range(32)), num_tokens=32)
+    local_tokens = 0
+    if early_return == "consumer":
+        scheduler.kv_role = "kv_consumer"
+        scheduler.consumer_is_to_load = False
+    elif early_return == "short_prompt":
+        request.prompt_token_ids = [1]
+    else:
+        local_tokens = 32
+    assert scheduler.get_num_new_matched_tokens(request, local_tokens) == (0, False)
+    assert request.request_id not in scheduler.load_specs
+
+
+@pytest.mark.parametrize("pool_hit_tokens", [832, 896])
+def test_layerwise_partial_tail_preserves_zero_external_load(pool_hit_tokens):
+    scheduler = KVPoolScheduler(make_config(block_size=256, extra_config={"backend": "memcache"}), use_layerwise=True)
+    scheduler._get_layerwise_hit_tokens = MagicMock(return_value=pool_hit_tokens)
+    request = SimpleNamespace(
+        request_id="partial-tail", prompt_token_ids=list(range(2048)), num_tokens=2048, block_hashes=[b"h"] * 8
+    )
+    actual_local_tokens = 896
+    partial_tail = actual_local_tokens % 256
+    aligned_local_tokens = actual_local_tokens - partial_tail
+    external_tokens, load_async = scheduler.get_num_new_matched_tokens(request, aligned_local_tokens)
+    assert external_tokens == pool_hit_tokens - aligned_local_tokens
+    assert 0 < external_tokens <= partial_tail
+    assert not load_async
+
+    # The scheduler keeps the longer/equal local partial tail and adopts no
+    # external tokens. Layerwise loading must retain its original semantics.
+    admitted_external_tokens = 0 if external_tokens <= partial_tail else external_tokens
+    scheduler.update_state_after_alloc(request, MagicMock(), admitted_external_tokens)
+    load_spec = scheduler.load_specs[request.request_id]
+    assert load_spec.vllm_cached_tokens == aligned_local_tokens
+    assert load_spec.kvpool_cached_tokens == pool_hit_tokens
+    assert load_spec.can_load
